@@ -1,0 +1,28 @@
+[package]
+name = "scheduled-task-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+regex.workspace = true
+jiff.workspace = true
+ron.workspace = true
+directories.workspace = true
+tracing-subscriber.workspace = true
+tracing-appender.workspace = true
+encoding_rs = "0.8" # GBK/系统码页解码:std 无此能力,Firefox 出品事实标准(iconv 维护差;codepage-strings 仍依赖本库)
+
+[target.'cfg(windows)'.dependencies]
+# 按需启用进程管理、线程恢复和代码页相关 API。
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Globalization",
+    "Win32_Security",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }

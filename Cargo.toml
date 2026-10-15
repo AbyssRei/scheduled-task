@@ -1,0 +1,25 @@
+[workspace]
+resolver = "2"
+members = ["crates/core"]
+
+[workspace.package]
+version = "0.3.0"
+edition = "2024"
+publish = false
+authors = ["AbyssRei <AbyssRei@outlook.com>"]
+
+[workspace.dependencies]
+scheduled-task-core = { path = "crates/core" }
+serde = { version = "1", features = ["derive"] }
+ron = "0.12"
+regex = "1"
+jiff = { version = "0.2", features = ["serde"] }
+async-channel = "2.5"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+thiserror = "2"
+directories = "6"
+
+[profile.release]
+lto = "thin"

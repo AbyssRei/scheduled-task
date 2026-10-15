@@ -1,0 +1,257 @@
+//! 脚本落盘、路径规范化与解析器启动命令构建。
+
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use crate::model::{PyLauncher, ScriptKind, ScriptSource, ScriptSpec};
+
+use super::RunnerError;
+
+/// 同一进程中的每次执行独占临时脚本,防止不同任务相互覆盖。
+static INLINE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// 按扩展名推断 ScriptKind(Auto)。
+fn infer_kind(path: &Path) -> ScriptKind {
+    match path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("bat") | Some("cmd") => ScriptKind::Cmd,
+        Some("ps1") => ScriptKind::PowerShell,
+        Some("py") => ScriptKind::Python {
+            launcher: PyLauncher::System,
+        },
+        Some("sh") => ScriptKind::Bash,
+        _ => ScriptKind::Auto, // exe / 其他:直接执行
+    }
+}
+
+/// 脚本落盘:内联内容写临时文件,按类型给扩展名。
+fn materialize(spec: &ScriptSpec) -> Result<PathBuf, RunnerError> {
+    match &spec.source {
+        // 相对路径按 CWD 解析后取绝对路径(工作目录会被切换到脚本所在目录,
+        // 传给子进程的必须自洽),并统一反斜杠(cmd 下 `/` 会被当开关)
+        ScriptSource::File(p) => {
+            let pb = PathBuf::from(p);
+            let abs = if pb.is_absolute() {
+                pb
+            } else {
+                std::fs::canonicalize(&pb)
+                    .map_err(|e| RunnerError::Resolve(format!("{}: {e}", p)))?
+            };
+            // canonicalize 产生 \\?\ VERBATIM 前缀,cmd 无法识别,剥掉
+            let s = abs.to_string_lossy();
+            let s = s.strip_prefix(r"\\?\").unwrap_or(&s);
+            Ok(normalize_separators(PathBuf::from(s)))
+        }
+        ScriptSource::Inline(content) => {
+            let ext = match &spec.kind {
+                ScriptKind::Cmd => "bat",
+                ScriptKind::PowerShell | ScriptKind::Pwsh => "ps1",
+                ScriptKind::Python { .. } => "py",
+                ScriptKind::Bash | ScriptKind::Sh => "sh",
+                _ => "txt",
+            };
+            let dir = std::env::temp_dir().join("scheduled-task-inline");
+            std::fs::create_dir_all(&dir).map_err(|e| RunnerError::TempFile(e.to_string()))?;
+            let sequence = INLINE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let path = dir.join(format!("inline-{}-{sequence}.{ext}", std::process::id()));
+            std::fs::write(&path, content).map_err(|e| RunnerError::TempFile(e.to_string()))?;
+            Ok(normalize_separators(path))
+        }
+    }
+}
+
+/// Windows 下统一路径分隔符为反斜杠。
+fn normalize_separators(p: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let s = p.to_string_lossy().replace('/', "\\");
+        PathBuf::from(s)
+    }
+    #[cfg(not(windows))]
+    p
+}
+
+/// PATH 探测(避免引入 which 依赖)。
+#[cfg(windows)]
+fn find_in_path(program: &str) -> bool {
+    let exe = format!("{program}.exe");
+    std::env::var_os("PATH")
+        .map(|paths| std::env::split_paths(&paths).any(|dir| dir.join(&exe).is_file()))
+        .unwrap_or(false)
+}
+
+/// 解析后的启动命令。
+pub(super) struct ResolvedCommand {
+    pub(super) program: String,
+    pub(super) args: Vec<String>,
+    /// 启动后向 stdin 喂一个换行(自动应答 `pause`)
+    pub(super) feed_newline_stdin: bool,
+    pub(super) working_dir: Option<PathBuf>,
+    /// 命令持有临时文件直到执行与输出读取全部完成。
+    temp_file: Option<PathBuf>,
+}
+
+impl Drop for ResolvedCommand {
+    fn drop(&mut self) {
+        if let Some(path) = &self.temp_file {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+/// 根据 ScriptKind 构建对应解释器的启动命令。
+pub(super) fn resolve(spec: &ScriptSpec) -> Result<ResolvedCommand, RunnerError> {
+    let path = materialize(spec)?;
+    let working_dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(Path::to_path_buf);
+
+    let kind = match &spec.kind {
+        ScriptKind::Auto => infer_kind(&path),
+        other => other.clone(),
+    };
+
+    let mut cmd = ResolvedCommand {
+        program: path.to_string_lossy().into_owned(),
+        args: Vec::new(),
+        feed_newline_stdin: false,
+        working_dir,
+        temp_file: matches!(spec.source, ScriptSource::Inline(_)).then(|| path.clone()),
+    };
+
+    match kind {
+        // cmd /c call,保留 pause 应答(stdin 喂换行)
+        ScriptKind::Cmd => {
+            cmd.program = "cmd".into();
+            cmd.args = vec![
+                "/c".into(),
+                "call".into(),
+                path.to_string_lossy().into_owned(),
+            ];
+            cmd.feed_newline_stdin = true;
+        }
+        ScriptKind::PowerShell | ScriptKind::Pwsh => {
+            cmd.program = if kind == ScriptKind::Pwsh {
+                "pwsh".into()
+            } else {
+                "powershell".into()
+            };
+            cmd.args = [
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                &path.to_string_lossy(),
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        }
+        ScriptKind::Python { launcher } => match launcher {
+            PyLauncher::System => {
+                cmd.program = "python".into();
+                cmd.args = vec![path.to_string_lossy().into_owned()];
+            }
+            PyLauncher::Uv { project } => {
+                cmd.program = "uv".into();
+                cmd.args = vec!["run".into()];
+                if let Some(p) = project {
+                    cmd.args.push("--project".into());
+                    cmd.args.push(p);
+                }
+                cmd.args.push(path.to_string_lossy().into_owned());
+            }
+        },
+        ScriptKind::Bash | ScriptKind::Sh => {
+            let shell = if kind == ScriptKind::Bash {
+                "bash"
+            } else {
+                "sh"
+            };
+            #[cfg(windows)]
+            {
+                // Windows 优先探测 Git Bash,其次 WSL
+                if find_in_path("bash") {
+                    cmd.program = "bash".into();
+                    cmd.args = vec![path.to_string_lossy().into_owned()];
+                } else {
+                    cmd.program = "wsl".into();
+                    cmd.args = vec![shell.into(), wsl_path(&path)];
+                }
+            }
+            #[cfg(not(windows))]
+            {
+                cmd.program = shell.into();
+                cmd.args = vec![path.to_string_lossy().into_owned()];
+            }
+        }
+        ScriptKind::Manual { command } => {
+            let line = command.replace("{script}", &path.to_string_lossy());
+            #[cfg(windows)]
+            {
+                cmd.program = "cmd".into();
+                cmd.args = vec!["/c".into(), "call".into(), line];
+                cmd.feed_newline_stdin = true;
+            }
+            #[cfg(not(windows))]
+            {
+                cmd.program = "sh".into();
+                cmd.args = vec!["-c".into(), line];
+            }
+        }
+        // exe / 未知扩展:直接执行
+        ScriptKind::Auto => {}
+    }
+    Ok(cmd)
+}
+
+#[cfg(windows)]
+fn wsl_path(path: &Path) -> String {
+    // E:\x\y → /mnt/e/x/y
+    let s = path.to_string_lossy().replace('\\', "/");
+    if let Some(rest) = s.strip_prefix('/')
+        && rest.len() >= 2
+        && rest.as_bytes()[1] == b':'
+    {
+        let drive = rest[..1].to_ascii_lowercase();
+        return format!("/mnt/{drive}{}", &rest[2..]);
+    }
+    s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn concurrent_inline_scripts_keep_distinct_content_and_are_cleaned_up() {
+        let first = resolve(&ScriptSpec {
+            kind: ScriptKind::Cmd,
+            source: ScriptSource::Inline("echo first".into()),
+        })
+        .unwrap();
+        let second = resolve(&ScriptSpec {
+            kind: ScriptKind::Cmd,
+            source: ScriptSource::Inline("echo second".into()),
+        })
+        .unwrap();
+        let first_path = first.temp_file.clone().unwrap();
+        let second_path = second.temp_file.clone().unwrap();
+        assert_ne!(first_path, second_path);
+        assert_eq!(std::fs::read_to_string(&first_path).unwrap(), "echo first");
+        assert_eq!(
+            std::fs::read_to_string(&second_path).unwrap(),
+            "echo second"
+        );
+        drop(first);
+        assert!(!first_path.exists());
+        assert!(second_path.exists());
+        drop(second);
+        assert!(!second_path.exists());
+    }
+}
