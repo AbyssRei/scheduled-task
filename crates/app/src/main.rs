@@ -130,8 +130,8 @@ fn main() {
                 cx,
                 |window, cx| {
                     // 关窗 → 隐藏到托盘;真正退出走托盘菜单
-                    window.on_window_should_close(cx, |window, _| {
-                        desktop::hide_window(window);
+                    window.on_window_should_close(cx, |window, cx| {
+                        desktop::hide_window(window, cx);
                         false
                     });
                     cx.new(|cx| TaskListView::new(core.clone(), window, cx))
