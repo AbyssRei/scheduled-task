@@ -23,11 +23,10 @@ use windows::Win32::System::JobObjects::{
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
     SetInformationJobObject, TerminateJobObject,
 };
-use windows::Win32::System::Threading::{OpenThread, ResumeThread, THREAD_SUSPEND_RESUME};
+use windows::Win32::System::Threading::{
+    CREATE_NO_WINDOW, CREATE_SUSPENDED, OpenThread, ResumeThread, THREAD_SUSPEND_RESUME,
+};
 use windows::core::Result as WinResult;
-
-/// CREATE_SUSPENDED 创建标志。
-const CREATE_SUSPENDED_FLAG: u32 = 0x0000_0004;
 
 /// Job Object 句柄守护。持有期间作业内进程存活;drop 只关句柄
 /// (KILL_ON_JOB_CLOSE 意味着最后一把句柄关闭时作业内进程被内核终止,
@@ -65,10 +64,11 @@ impl JobGuard {
         }
     }
 
-    /// 以 CREATE_SUSPENDED 启动命令 → 分配进作业 → 恢复主线程。
+    /// 无控制台窗口、挂起启动命令 → 分配进作业 → 恢复主线程。
     pub fn spawn_into_job(command: &mut Command) -> Result<(Child, Self), JobError> {
         use std::os::windows::process::CommandExt as _;
-        command.creation_flags(CREATE_SUSPENDED_FLAG);
+        // 创建时隐藏控制台,避免先弹窗再隐藏造成闪烁;输出仍通过管道捕获。
+        command.creation_flags((CREATE_SUSPENDED | CREATE_NO_WINDOW).0);
         let child = command.spawn()?;
         let job = Self::create()?;
         unsafe {
