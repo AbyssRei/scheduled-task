@@ -1,0 +1,140 @@
+name: 构建与发布
+run-name: 构建与发布 ${{ github.ref_name }}
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: pwsh
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  ci:
+    name: 检查、测试与打包（Windows x64）
+    runs-on: windows-latest
+    timeout-minutes: 90
+    outputs:
+      archive: ${{ steps.version.outputs.archive }}
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: 安装 Rust 工具链
+        uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          components: rustfmt, clippy
+          cache: false
+
+      - name: 缓存 Rust 依赖
+        uses: Swatinem/rust-cache@v2
+        with:
+          # 发布标签保存结果，PR 仅使用已有缓存。
+          save-if: ${{ github.ref_type == 'tag' || github.ref == 'refs/heads/main' }}
+
+      - name: 安装脚本集成测试所需的 uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: false
+          python-version: '3.14'
+
+      - name: 预装测试用 Python
+        run: uv python install
+
+      - name: 读取版本并校验发布标签
+        id: version
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          IS_TAG_PUSH: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
+        run: |
+          $metadataJson = cargo metadata --locked --no-deps --format-version 1
+          if ($LASTEXITCODE -ne 0) {
+            throw "读取 Cargo 元数据失败：$LASTEXITCODE"
+          }
+          $metadata = $metadataJson | ConvertFrom-Json
+          $package = @($metadata.packages | Where-Object { $_.name -eq 'scheduled-task' })
+          if ($package.Count -ne 1) {
+            throw '未找到唯一的 scheduled-task 应用包。'
+          }
+          $version = $package[0].version
+          if ($env:IS_TAG_PUSH -eq 'true' -and $env:RELEASE_TAG -cne "v$version") {
+            throw "发布标签 '$env:RELEASE_TAG' 与 workspace 版本 'v$version' 不一致。"
+          }
+          "archive=scheduled-task-v$version-dist.7z" >> $env:GITHUB_OUTPUT
+
+      - name: 格式检查
+        run: cargo fmt --all -- --check
+
+      - name: 静态检查
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
+      - name: 全量测试
+        run: cargo test --locked --workspace
+
+      - name: 构建发布程序
+        run: cargo build --locked --release -p scheduled-task
+
+      - name: 打包并校验压缩包
+        env:
+          ARCHIVE_NAME: ${{ steps.version.outputs.archive }}
+        run: |
+          Get-Command 7z -ErrorAction Stop | Out-Null
+          & ./scripts/build.ps1 -SkipBuild
+          if ($LASTEXITCODE -ne 0) {
+            throw "打包失败：$LASTEXITCODE"
+          }
+          $archive = Join-Path 'dist' $env:ARCHIVE_NAME
+          if (-not (Test-Path -LiteralPath $archive -PathType Leaf)) {
+            throw "未找到发布压缩包：$archive"
+          }
+          & 7z t $archive
+          if ($LASTEXITCODE -ne 0) {
+            throw "压缩包校验失败：$LASTEXITCODE"
+          }
+
+      - name: 上传发布包
+        uses: actions/upload-artifact@v7
+        with:
+          name: scheduled-task-windows-x64
+          path: dist/${{ steps.version.outputs.archive }}
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
+  release:
+    name: 发布 GitHub Release
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: ci
+    runs-on: windows-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: 下载已验证的发布包
+        uses: actions/download-artifact@v8
+        with:
+          name: scheduled-task-windows-x64
+          path: dist
+
+      - name: 创建 GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: dist/${{ needs.ci.outputs.archive }}
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
