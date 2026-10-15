@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use scheduled_task_core::daemon::{Daemon, DaemonEvent};
+use scheduled_task_core::logger::{self, LogLevel};
 use scheduled_task_core::model::{TaskConfig, TaskId};
 use scheduled_task_core::state::TaskStatus;
 use scheduled_task_core::store::{ConfigFile, TaskStore, ThemeSetting};
@@ -21,6 +22,7 @@ pub struct AppCore {
     next_id: AtomicU64,
     max_parallel: AtomicU64,
     theme: Mutex<ThemeSetting>,
+    log_level: Mutex<LogLevel>,
 }
 
 impl AppCore {
@@ -28,6 +30,9 @@ impl AppCore {
     pub fn init(daemon: Arc<Daemon>) -> Result<Arc<Self>, String> {
         let store = TaskStore::default_path().map_err(|e| e.to_string())?;
         let config: ConfigFile = store.load().map_err(|e| e.to_string())?;
+        if let Err(error) = logger::set_log_level(config.log_level) {
+            tracing::warn!("无法应用文件日志等级: {error}");
+        }
         let mut tasks = config.tasks;
         // id 递增计数器:重启后取 max+1
         let mut next = 1_u64;
@@ -51,6 +56,7 @@ impl AppCore {
             next_id: AtomicU64::new(next),
             max_parallel: AtomicU64::new(config.max_parallel.max(1) as u64),
             theme: Mutex::new(theme),
+            log_level: Mutex::new(config.log_level),
         }))
     }
 
@@ -126,6 +132,29 @@ impl AppCore {
         self.save();
     }
 
+    /// 当前管理器文件日志等级。
+    pub fn log_level(&self) -> LogLevel {
+        *self.log_level.lock().unwrap()
+    }
+
+    /// 立即调整文件日志并保存;保存失败时恢复之前的运行等级。
+    pub fn set_log_level(&self, level: LogLevel) -> Result<(), String> {
+        let mut config = self.config_snapshot();
+        let previous = config.log_level;
+        logger::set_log_level(level)?;
+        config.log_level = level;
+        if let Err(error) = self.store.save(&config) {
+            return match logger::set_log_level(previous) {
+                Ok(()) => Err(format!("保存日志等级失败: {error}")),
+                Err(restore_error) => Err(format!(
+                    "保存日志等级失败: {error}; 恢复运行等级失败: {restore_error}"
+                )),
+            };
+        }
+        *self.log_level.lock().unwrap() = level;
+        Ok(())
+    }
+
     pub fn stop(&self, id: TaskId) -> bool {
         self.daemon.stop_task(id)
     }
@@ -136,15 +165,19 @@ impl AppCore {
         self.save();
         self.daemon.notify_config_changed();
     }
-    fn save(&self) {
+    fn config_snapshot(&self) -> ConfigFile {
         let tasks = self.tasks.lock().unwrap().clone();
-        let config = ConfigFile {
+        ConfigFile {
             config_version: scheduled_task_core::store::CONFIG_VERSION,
             theme: Some(*self.theme.lock().unwrap()),
             tasks,
             max_parallel: self.max_parallel() as u32,
-        };
-        if let Err(e) = self.store.save(&config) {
+            log_level: self.log_level(),
+        }
+    }
+
+    fn save(&self) {
+        if let Err(e) = self.store.save(&self.config_snapshot()) {
             tracing::error!("保存任务配置失败: {e}");
         }
     }

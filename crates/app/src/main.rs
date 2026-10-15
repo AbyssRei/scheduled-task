@@ -58,7 +58,7 @@ fn main() {
         return;
     }
 
-    // 日志:CWD logs/(控制台 INFO / 文件 DEBUG)
+    // 日志:CWD logs/,默认 INFO;核心加载配置后应用保存的文件日志等级。
     let _ = scheduled_task_core::logger::init_logging(std::path::Path::new("logs"));
 
     if let Err(error) = scheduled_task_keepalive::ensure_watchdog() {

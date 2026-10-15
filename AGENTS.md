@@ -26,7 +26,7 @@ Windows 桌面定时任务管理器，使用 Rust + GPUI Kit。支持每日、�
   - `scheduler.rs`：本地时间调度和 FireTracker 当日去重。
   - `store.rs`：`%APPDATA%\scheduled-task\tasks.ron` 读写。
   - `daemon.rs`：原子准入、执行上限、组互斥和有界队列。
-  - `logger.rs`：控制台默认 INFO，文件 DEBUG，按天轮转并保留 5 个文件，无单文件大小限制。
+  - `logger.rs`：控制台和文件默认 INFO，管理器文件等级支持设置中即时调整并持久化，按天轮转并保留 5 个文件，无单文件大小限制。
 - `crates/core/tests/`：真实脚本执行及并发队列集成测试。
 - `crates/cli/`：无头调度与立即执行入口；`testdata/` 含示例配置和脚本。
 - `crates/keepalive/`：无 UI 的管理器保活、独立 `--watchdog` 入口、单实例和 Windows 计划任务集成；使用说明见 `docs/KEEPALIVE.md`。

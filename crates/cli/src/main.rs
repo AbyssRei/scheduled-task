@@ -35,6 +35,10 @@ fn run(config_path: &str, only_task: Option<&str>) {
             std::process::exit(1);
         }
     };
+    if let Err(error) = scheduled_task_core::logger::set_log_level(config.log_level) {
+        eprintln!("应用文件日志等级失败: {error}");
+        std::process::exit(1);
+    }
     println!(
         "已加载配置 {}(config_version {},{} 个任务)",
         config_path,
