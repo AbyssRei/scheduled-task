@@ -1,0 +1,23 @@
+// 从仓库根目录运行;演示同一时间触发的任务在全局/组约束下等待。
+// 请将时间改为未来时间观察调度,启动前过去的时刻不会补跑。
+(
+    config_version: 2,
+    max_parallel: 2,
+    tasks: [
+        (
+            id: (1), name: "备份一", concurrency: group("备份"),
+            script: (kind: cmd, source: inline("@echo off\r\necho backup-one\r\nping 127.0.0.1 -n 3 >nul\r\n")),
+            schedule: daily(times: ["23:59:00"]),
+        ),
+        (
+            id: (2), name: "备份二", concurrency: group("备份"),
+            script: (kind: cmd, source: inline("@echo off\r\necho backup-two\r\nping 127.0.0.1 -n 3 >nul\r\n")),
+            schedule: daily(times: ["23:59:00"]),
+        ),
+        (
+            id: (3), name: "独立任务", concurrency: parallel,
+            script: (kind: cmd, source: inline("@echo off\r\necho independent\r\nping 127.0.0.1 -n 3 >nul\r\n")),
+            schedule: daily(times: ["23:59:00"]),
+        ),
+    ],
+)

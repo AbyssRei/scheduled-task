@@ -1,0 +1,16 @@
+// 示例配置:每日 00:00:01 触发;启动时已过去的时刻不补跑。
+(
+    config_version: 2,
+    max_parallel: 1,
+    tasks: [
+        (
+            id: (1),
+            name: "演示任务",
+            script: (
+                kind: auto,
+                source: file("crates/cli/testdata/echo_ok.bat"),
+            ),
+            schedule: daily(times: ["00:00:01"]),
+        ),
+    ],
+)
