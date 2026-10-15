@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/core", "crates/cli"]
+members = ["crates/core", "crates/cli", "crates/keepalive"]
 
 [workspace.package]
 version = "0.1.0-dev.0"
@@ -10,6 +10,7 @@ authors = ["AbyssRei <AbyssRei@outlook.com>"]
 
 [workspace.dependencies]
 scheduled-task-core = { path = "crates/core" }
+scheduled-task-keepalive = { path = "crates/keepalive" }
 serde = { version = "1", features = ["derive"] }
 ron = "0.12"
 regex = "1"
