@@ -1,0 +1,26 @@
+[package]
+name = "scheduled-task"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+build = "build.rs"
+
+[dependencies]
+gpui-kit = "0.7.3"
+gpui-tray = { version = "0.1.4", default-features = false, features = ["gpui-kit"] }
+scheduled-task-core.workspace = true
+scheduled-task-keepalive.workspace = true
+async-channel.workspace = true
+tracing.workspace = true
+jiff.workspace = true
+raw-window-handle = "0.6" # 与 gpui-pre 同版本;关窗隐藏到托盘需经 HasWindowHandle 取 HWND
+
+[target.'cfg(windows)'.dependencies]
+# 仅 ShowWindow(关窗隐藏/托盘恢复)一个用途
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[build-dependencies]
+winresource = "0.1"
