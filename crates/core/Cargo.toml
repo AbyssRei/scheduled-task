@@ -26,3 +26,10 @@ windows = { version = "0.62", features = [
     "Win32_System_JobObjects",
     "Win32_System_Threading",
 ] }
+
+[target.'cfg(windows)'.dev-dependencies]
+# 真实子进程测试检查控制台窗口，不影响生产构建。
+windows = { version = "0.62", features = [
+    "Win32_System_Console",
+    "Win32_UI_WindowsAndMessaging",
+] }
