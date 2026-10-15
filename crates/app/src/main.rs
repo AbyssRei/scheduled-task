@@ -36,8 +36,10 @@ fn main() {
         let _ = scheduled_task_core::logger::init_logging(&log_dir);
         if let Err(error) = scheduled_task_keepalive::run_watchdog() {
             tracing::error!("保活守护已停止：{error}");
+            scheduled_task_core::logger::shutdown_logging();
             std::process::exit(1);
         }
+        scheduled_task_core::logger::shutdown_logging();
         return;
     }
     let background = args.iter().any(|arg| arg == "--background");
@@ -86,9 +88,18 @@ fn main() {
         .expect("启动调度线程失败");
 
     // 组件的关闭、下拉等图标通过资源路径加载,必须注册内置 SVG 资源。
+    let daemon_for_quit = daemon.clone();
     gpui_kit::application()
         .with_assets(gpui_kit::assets::Assets)
         .run(move |cx: &mut App| {
+            // 普通退出及系统结束会话都会触发;同步刷新,避免进程退出跳过静态析构。
+            cx.on_app_quit(move |_| {
+                daemon_for_quit.shutdown();
+                tracing::info!("管理器正在退出");
+                scheduled_task_core::logger::shutdown_logging();
+                async {}
+            })
+            .detach();
             gpui_kit::init(cx);
             // 启动时应用持久化的界面主题(未设置 = 跟随系统)
             settings_view::apply_theme_setting(core.theme_setting(), cx);
@@ -150,6 +161,7 @@ fn main() {
             tracing::info!("主窗口已打开");
         });
     daemon.shutdown();
+    scheduled_task_core::logger::shutdown_logging();
 }
 
 fn show_startup_error(message: &str) {
