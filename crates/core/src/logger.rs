@@ -78,6 +78,8 @@ pub fn init_logging(log_dir: &Path) -> std::io::Result<()> {
     let file_layer = tracing_subscriber::fmt::layer()
         .with_writer(file_writer)
         .with_ansi(false)
+        .with_file(true)
+        .with_line_number(true)
         .with_filter(file_filter);
 
     let console_layer = tracing_subscriber::fmt::layer()
