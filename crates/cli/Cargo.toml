@@ -1,0 +1,8 @@
+[package]
+name = "scheduled-task-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[dependencies]
+scheduled-task-core.workspace = true
