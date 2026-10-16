@@ -101,8 +101,8 @@ pub fn init_tray(cx: &mut App) -> bool {
     });
     cx.on_action(|_: &TrayShow, cx| {
         if let Some(handle) = cx.try_global::<MainWindowHandle>() {
-            let _ = handle.0.update(cx, |_, window, _| {
-                show_window(window);
+            let _ = handle.0.update(cx, |_, window, cx| {
+                show_window(window, cx);
                 window.activate_window();
             });
         }
@@ -125,7 +125,7 @@ fn show_keepalive_error(message: String, cx: &mut App) {
     tracing::warn!("保活操作未完成: {message}");
     if let Some(handle) = cx.try_global::<MainWindowHandle>() {
         let _ = handle.0.update(cx, |_, window, cx| {
-            show_window(window);
+            show_window(window, cx);
             window.activate_window();
             window.open_alert_dialog(cx, move |alert, _, _| {
                 alert
@@ -144,48 +144,58 @@ pub fn register_main_window(handle: gpui_kit::AnyWindowHandle, cx: &mut App) {
 #[cfg(windows)]
 use windows::Win32::UI::WindowsAndMessaging::SHOW_WINDOW_CMD;
 
-/// 经 raw-window-handle 取本窗口 HWND 并调用 ShowWindow。
+/// 延后原生显隐,避免窗口消息在 GPUI 更新借用期间同步重入。
 /// - `SW_HIDE`:关窗时隐藏到托盘
 /// - `SW_RESTORE`:托盘"显示窗口"恢复(顺带还原最小化状态)
 #[cfg(windows)]
-fn with_native_window(window: &gpui_kit::Window, show_cmd: SHOW_WINDOW_CMD) -> bool {
+fn with_native_window(window: &gpui_kit::Window, cx: &App, show_cmd: SHOW_WINDOW_CMD) {
     use raw_window_handle::RawWindowHandle;
     use windows::Win32::Foundation::HWND;
-    use windows::Win32::UI::WindowsAndMessaging::ShowWindow;
+    use windows::Win32::UI::WindowsAndMessaging::{IsWindow, ShowWindowAsync};
 
-    // gpui Window 的固有 window_handle() 返回 AnyWindowHandle,
-    // 须经 trait 全路径调用取 rwh 的 WindowHandle,再 as_raw 拿 Win32 句柄
-    let Ok(handle) = raw_window_handle::HasWindowHandle::window_handle(window) else {
-        return false;
-    };
-    if let RawWindowHandle::Win32(win32) = handle.as_raw() {
-        // SAFETY:ShowWindow 仅切换可见性;HWND 来自 gpui 自身的窗口实现
-        unsafe {
-            let _ = ShowWindow(HWND(win32.hwnd.get() as *mut _), show_cmd);
-        }
-        true
-    } else {
-        false
-    }
+    let window_handle = window.window_handle();
+    let mut async_cx = cx.to_async();
+    cx.foreground_executor()
+        .spawn(async move {
+            // 执行时重新解析 GPUI 窗口身份,关闭后不再使用排队前的 HWND。
+            let Ok(Some(hwnd)) = window_handle.update(&mut async_cx, |_, window, _| {
+                let handle = raw_window_handle::HasWindowHandle::window_handle(window).ok()?;
+                match handle.as_raw() {
+                    RawWindowHandle::Win32(win32) => Some(HWND(win32.hwnd.get() as *mut _)),
+                    _ => None,
+                }
+            }) else {
+                return;
+            };
+
+            // update 已返回,App/Window 的借用已经释放;此处到显隐之间不再 await。
+            // SAFETY:HWND 来自当前存活的 GPUI 窗口,并在同一 UI 线程再次确认有效。
+            unsafe {
+                if IsWindow(Some(hwnd)).as_bool() && !ShowWindowAsync(hwnd, show_cmd).as_bool() {
+                    tracing::warn!("无法切换主窗口可见性");
+                }
+            }
+        })
+        .detach();
 }
 
 #[cfg(windows)]
-pub fn hide_window(window: &gpui_kit::Window) {
+pub fn hide_window(window: &gpui_kit::Window, cx: &App) {
     use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
-    with_native_window(window, SW_HIDE);
+    with_native_window(window, cx, SW_HIDE);
 }
 
 #[cfg(windows)]
-fn show_window(window: &gpui_kit::Window) {
+fn show_window(window: &gpui_kit::Window, cx: &App) {
     use windows::Win32::UI::WindowsAndMessaging::SW_RESTORE;
-    with_native_window(window, SW_RESTORE);
+    with_native_window(window, cx, SW_RESTORE);
 }
 
 #[cfg(not(windows))]
-pub fn hide_window(_: &gpui_kit::Window) {}
+pub fn hide_window(_: &gpui_kit::Window, _: &App) {}
 
 #[cfg(not(windows))]
-fn show_window(_: &gpui_kit::Window) {}
+fn show_window(_: &gpui_kit::Window, _: &App) {}
 
 fn build_tray(cx: &mut App) -> gpui_tray::Result<Tray> {
     Tray::builder()

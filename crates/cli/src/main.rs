@@ -17,24 +17,34 @@ fn main() {
         Some("run") if args.len() >= 2 => run(&args[1], args.get(3).map(String::as_str)),
         _ => {
             eprintln!("用法: scheduled-task-cli run <config.ron> [--task <id|名称>]");
-            std::process::exit(2);
+            exit_with_logs(2);
         }
     }
+    scheduled_task_core::logger::shutdown_logging();
+}
+
+fn exit_with_logs(code: i32) -> ! {
+    scheduled_task_core::logger::shutdown_logging();
+    std::process::exit(code)
 }
 
 fn run(config_path: &str, only_task: Option<&str>) {
     if let Err(e) = init_logging(std::path::Path::new("logs")) {
         eprintln!("初始化日志失败: {e}");
-        std::process::exit(1);
+        exit_with_logs(1);
     }
     let store = TaskStore::new(config_path.into());
     let config = match store.load() {
         Ok(c) => c,
         Err(e) => {
             eprintln!("加载配置失败: {e}");
-            std::process::exit(1);
+            exit_with_logs(1);
         }
     };
+    if let Err(error) = scheduled_task_core::logger::set_log_level(config.log_level) {
+        eprintln!("应用文件日志等级失败: {error}");
+        exit_with_logs(1);
+    }
     println!(
         "已加载配置 {}(config_version {},{} 个任务)",
         config_path,
@@ -67,7 +77,7 @@ fn run(config_path: &str, only_task: Option<&str>) {
             }
             None => {
                 eprintln!("未找到任务: {key}");
-                std::process::exit(1);
+                exit_with_logs(1);
             }
         }
         return;

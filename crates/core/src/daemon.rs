@@ -608,8 +608,17 @@ fn execute_attempts(
                 charset: Default::default(),
                 on_line: Some(Box::new({
                     let id = task.id;
+                    let name = task.name.clone();
                     let tx = event_tx.clone();
                     move |line| {
+                        // 输出随执行逐行记录，界面关闭或事件接收端断开也不影响留存。
+                        tracing::info!(
+                            target: "scheduled_task_core::task_output",
+                            task_id = id.0,
+                            task_name = %name,
+                            attempt = u64::from(attempt) + 1,
+                            "{line}"
+                        );
                         let _ = tx.send(DaemonEvent::LogLine {
                             id,
                             line: line.to_string(),

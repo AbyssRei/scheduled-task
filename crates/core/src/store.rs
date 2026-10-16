@@ -9,6 +9,7 @@ use std::sync::Mutex;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::logger::LogLevel;
 use crate::model::TaskConfig;
 
 /// 配置文件顶层结构。
@@ -17,6 +18,9 @@ pub struct ConfigFile {
     pub config_version: u32,
     #[serde(default)]
     pub theme: Option<ThemeSetting>,
+    /// 文件日志等级,未设置时为 INFO。
+    #[serde(default)]
+    pub log_level: LogLevel,
     pub tasks: Vec<TaskConfig>,
     /// 全局同时运行的最大任务数,至少为 1。
     #[serde(default = "default_max_parallel")]
@@ -48,6 +52,7 @@ impl Default for ConfigFile {
         Self {
             config_version: CONFIG_VERSION,
             theme: None,
+            log_level: LogLevel::default(),
             tasks: Vec::new(),
             max_parallel: default_max_parallel(),
         }
@@ -185,6 +190,7 @@ mod tests {
             config_version: CONFIG_VERSION,
             max_parallel: 3,
             theme: None,
+            log_level: LogLevel::Debug,
             tasks: vec![TaskConfig {
                 id: crate::model::TaskId(1),
                 name: "每日同步".into(),
@@ -214,9 +220,11 @@ mod tests {
         assert!(text.contains("project: Some(\"demo\")"));
         assert!(text.contains("monthly("));
         assert!(text.contains("config_version: 2"));
+        assert!(text.contains("log_level: debug"));
         let back: ConfigFile = ron::Options::default().from_str(&text).unwrap();
         assert_eq!(back.tasks.len(), 1);
         assert_eq!(back.max_parallel, 3);
+        assert_eq!(back.log_level, LogLevel::Debug);
         assert_eq!(back.tasks[0].name, "每日同步");
         assert_eq!(back.tasks[0].timeout, Some(Duration::from_secs(30 * 60)));
     }
@@ -244,11 +252,35 @@ mod tests {
         let t = &back.tasks[0];
         assert_eq!(t.id, crate::model::TaskId(7));
         assert_eq!(back.max_parallel, 1);
+        assert_eq!(back.log_level, LogLevel::Info);
         assert!(t.enabled);
         assert!(t.retry.is_none());
         assert!(t.timeout.is_none());
         // 未指定策略时使用 Parallel。
         assert_eq!(t.concurrency, crate::model::ConcurrencyPolicy::Parallel);
+    }
+
+    #[test]
+    fn log_levels_roundtrip_and_reject_unknown_values() {
+        for (level, value) in [
+            (LogLevel::Error, "error"),
+            (LogLevel::Warn, "warn"),
+            (LogLevel::Info, "info"),
+            (LogLevel::Debug, "debug"),
+            (LogLevel::Trace, "trace"),
+        ] {
+            let source = format!("(config_version: 2, tasks: [], log_level: {value})");
+            let config: ConfigFile = ron::from_str(&source).unwrap();
+            assert_eq!(config.log_level, level);
+            let encoded = ron::ser::to_string(&config).unwrap();
+            let decoded: ConfigFile = ron::from_str(&encoded).unwrap();
+            assert_eq!(decoded.log_level, level);
+        }
+        assert_eq!(ConfigFile::default().log_level, LogLevel::Info);
+        assert!(
+            ron::from_str::<ConfigFile>("(config_version: 2, tasks: [], log_level: verbose)")
+                .is_err()
+        );
     }
 
     #[test]

@@ -1,4 +1,4 @@
-//! 主窗口内的设置对话框(主题、并发上限与管理器保活)。
+//! 主窗口内的设置对话框(主题、文件日志等级、并发上限与管理器保活)。
 //!
 //! 布局参考常见桌面应用设置页:左侧导航(基础设置 分组)+ 右侧内容区
 //! 与任务编辑共用对话框层,不创建原生子窗口。
@@ -16,6 +16,7 @@ use gpui_kit::{
     ParentElement as _, Render, StatefulInteractiveElement as _, Styled, Window, div, px,
 };
 
+use scheduled_task_core::logger::LogLevel;
 use scheduled_task_core::store::ThemeSetting;
 
 use crate::bridge::AppCore;
@@ -25,6 +26,7 @@ struct SettingsView {
     core: Arc<AppCore>,
     max_parallel: Entity<InputState>,
     message: String,
+    log_level_message: String,
     keepalive_enabled: bool,
     keepalive_busy: bool,
     keepalive_message: String,
@@ -107,6 +109,31 @@ impl Render for SettingsView {
             })
         });
 
+        let current_log_level = self.core.log_level();
+        let log_level_buttons = [
+            ("log-error", "错误", LogLevel::Error),
+            ("log-warn", "警告", LogLevel::Warn),
+            ("log-info", "信息", LogLevel::Info),
+            ("log-debug", "调试", LogLevel::Debug),
+            ("log-trace", "跟踪", LogLevel::Trace),
+        ]
+        .into_iter()
+        .map(|(id, label, level)| {
+            let btn = Button::new(id).label(label).w(px(72.)).h(px(30.));
+            let btn = if current_log_level == level {
+                btn.primary()
+            } else {
+                btn
+            };
+            btn.on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                this.log_level_message = match this.core.set_log_level(level) {
+                    Ok(()) => format!("文件日志等级已设为{label},即时生效"),
+                    Err(error) => format!("设置文件日志等级失败: {error}"),
+                };
+                cx.notify();
+            }))
+        });
+
         // 左侧导航:基础设置 分组 → 常规设置(当前页,高亮)
         let sidebar = div()
             .w(px(160.))
@@ -175,6 +202,25 @@ impl Render for SettingsView {
                             )
                             .child(h_flex().gap_1().children(theme_buttons)),
                     ),
+            )
+            .child(
+                v_flex()
+                    .gap_2()
+                    .child(div().child("文件日志等级"))
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(cx.theme().muted_foreground)
+                            .child("控制文件日志的详细程度,默认“信息”。任务输出面板不受影响。"),
+                    )
+                    .child(h_flex().gap_1().children(log_level_buttons))
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(cx.theme().muted_foreground)
+                            .child("“调试”和“跟踪”会记录更多日志,排查问题后建议切回“信息”。"),
+                    )
+                    .child(div().text_size(px(12.)).child(self.log_level_message.clone())),
             )
             .child(
                 v_flex()
@@ -278,6 +324,7 @@ pub fn open_settings(core: Arc<AppCore>, window: &mut Window, cx: &mut App) {
             core,
             max_parallel,
             message: String::new(),
+            log_level_message: String::new(),
             keepalive_enabled,
             keepalive_busy: false,
             keepalive_message,
