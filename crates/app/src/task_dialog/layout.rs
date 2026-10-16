@@ -46,6 +46,48 @@ impl Render for TaskDialogView {
                     })),
             ))
             .child(field("手工命令", Input::new(&self.manual_cmd).h(px(32.))))
+            .child(field(
+                "命令行参数",
+                Textarea::new(&self.args).h(px(72.)).flex_1(),
+            ))
+            .child(field(
+                "工作目录",
+                h_flex()
+                    .flex_1()
+                    .gap_2()
+                    .child(Input::new(&self.working_dir).h(px(32.)).flex_1())
+                    .child(
+                        Button::new("btn-browse-working-dir")
+                            .label("浏览...")
+                            .on_click({
+                                let view = view.clone();
+                                move |_: &ClickEvent, _, cx| {
+                                    view.update(cx, |this, cx| this.browse_working_dir(cx))
+                                }
+                            }),
+                    ),
+            ))
+            .child(field(
+                "环境变量",
+                Textarea::new(&self.env).h(px(84.)).flex_1(),
+            ))
+            .child(field(
+                ".env 文件",
+                h_flex()
+                    .flex_1()
+                    .gap_2()
+                    .child(Input::new(&self.env_file).h(px(32.)).flex_1())
+                    .child(
+                        Button::new("btn-browse-env-file")
+                            .label("浏览...")
+                            .on_click({
+                                let view = view.clone();
+                                move |_: &ClickEvent, _, cx| {
+                                    view.update(cx, |this, cx| this.browse_env_file(cx))
+                                }
+                            }),
+                    ),
+            ))
             .child(field("调度类型", Combobox::new(&self.schedule_state)))
             .child(field(
                 "触发时间",

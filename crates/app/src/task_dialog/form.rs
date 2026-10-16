@@ -1,5 +1,7 @@
 //! 表单值到任务配置的转换与校验,不依赖 UI 控件。
 
+use std::collections::BTreeMap;
+
 use scheduled_task_core::model::{
     ConcurrencyPolicy, DayOfMonth, PyLauncher, RetryPolicy, Schedule, ScriptKind, ScriptSource,
     ScriptSpec, TaskConfig, TaskId,
@@ -72,6 +74,10 @@ pub(super) struct FormValues {
     pub path: String,
     pub kind_ix: usize,
     pub manual_cmd: String,
+    pub args: String,
+    pub working_dir: String,
+    pub env: String,
+    pub env_file: String,
     pub schedule_ix: usize,
     pub times: String,
     pub day: String,
@@ -96,6 +102,17 @@ impl FormValues {
         }
         let manual_cmd = self.manual_cmd;
         let kind = kind_from_ix(self.kind_ix, &manual_cmd);
+
+        let args = self
+            .args
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(ToOwned::to_owned)
+            .collect();
+        let working_dir = optional_path(&self.working_dir);
+        let env = parse_env_text(&self.env)?;
+        let env_file = optional_path(&self.env_file);
 
         let times_text = self.times;
         let mut times = Vec::new();
@@ -183,6 +200,10 @@ impl FormValues {
             script: ScriptSpec {
                 kind,
                 source: ScriptSource::File(path.trim().to_string()),
+                args,
+                working_dir,
+                env,
+                env_file,
             },
             schedule,
             retry,
@@ -191,6 +212,36 @@ impl FormValues {
             concurrency,
         })
     }
+}
+
+fn optional_path(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+/// 解析表单中的环境变量文本。每行一个 `KEY=VALUE`,空行和 `#` 注释忽略。
+pub(super) fn parse_env_text(text: &str) -> Result<BTreeMap<String, String>, String> {
+    let mut values = BTreeMap::new();
+    for (line_no, raw) in text.lines().enumerate() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let line = line.strip_prefix("export ").unwrap_or(line).trim_start();
+        let Some((key, value)) = line.split_once('=') else {
+            return Err(format!("环境变量第 {} 行缺少 '='", line_no + 1));
+        };
+        let key = key.trim();
+        if key.is_empty() || key.contains('=') || key.contains('\0') {
+            return Err(format!("环境变量第 {} 行的名称无效", line_no + 1));
+        }
+        let value = value.trim();
+        if value.contains('\0') {
+            return Err(format!("环境变量第 {} 行的值无效", line_no + 1));
+        }
+        values.insert(key.to_string(), value.to_string());
+    }
+    Ok(values)
 }
 
 #[cfg(test)]
@@ -205,6 +256,10 @@ mod tests {
             path: "  E:/scripts/backup.cmd  ".into(),
             kind_ix: 0,
             manual_cmd: String::new(),
+            args: String::new(),
+            working_dir: String::new(),
+            env: String::new(),
+            env_file: String::new(),
             schedule_ix: 0,
             times: "12:30:00,08:00:00;12:30:00".into(),
             day: String::new(),
@@ -220,7 +275,12 @@ mod tests {
 
     #[test]
     fn saves_trimmed_fields_without_reordering_times() {
-        let task = valid_form().into_config(TaskId(42)).unwrap();
+        let mut form = valid_form();
+        form.args = " --source\ninput file.txt \n".into();
+        form.working_dir = " E:/work ".into();
+        form.env = " MODE=fast\nCOUNT=2 ".into();
+        form.env_file = " .env ".into();
+        let task = form.into_config(TaskId(42)).unwrap();
         assert_eq!(task.id, TaskId(42));
         assert_eq!(task.name, "定时备份");
         assert!(matches!(
@@ -231,6 +291,10 @@ mod tests {
         assert_eq!(times.len(), 3);
         assert_eq!(times[0], times[2]);
         assert!(times[0] > times[1]);
+        assert_eq!(task.script.args, vec!["--source", "input file.txt"]);
+        assert_eq!(task.script.working_dir.as_deref(), Some("E:/work"));
+        assert_eq!(task.script.env.get("MODE"), Some(&"fast".to_string()));
+        assert_eq!(task.script.env_file.as_deref(), Some(".env"));
     }
 
     #[test]
@@ -332,5 +396,18 @@ mod tests {
                 "超时应为 1–300 分钟"
             );
         }
+    }
+
+    #[test]
+    fn parses_environment_lines_and_ignores_comments() {
+        let env = parse_env_text("# 注释\nexport A=1\nB=hello=world\nA=2\n").unwrap();
+        assert_eq!(env.get("A"), Some(&"2".to_string()));
+        assert_eq!(env.get("B"), Some(&"hello=world".to_string()));
+    }
+
+    #[test]
+    fn rejects_malformed_environment_lines() {
+        assert!(parse_env_text("NO_VALUE").is_err());
+        assert!(parse_env_text("=missing").is_err());
     }
 }

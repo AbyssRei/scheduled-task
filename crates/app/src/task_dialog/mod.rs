@@ -2,6 +2,7 @@
 //!
 //! 全字段表单:名称、脚本类型(下拉)、程序路径(浏览=GPUI 内置文件对话框)、
 //! 调度类型(每天/每月/自定义)+多时间点+monthly 日期、手工命令(Manual)、
+//! 命令行参数、工作目录、环境变量及 `.env` 文件、
 //! 自动重试(模式/窗口/最大次数)、超时(分钟)、启用开关。
 //! 范围校验:window 1–100、max_retries 1–10、
 //! timeout 1–300、day 1–31。
@@ -35,6 +36,10 @@ pub struct TaskDialogView {
     kind_state: Entity<ComboboxState<PickDelegate>>,
     kind_ix: usize,
     manual_cmd: Entity<InputState>,
+    args: Entity<TextareaState>,
+    working_dir: Entity<InputState>,
+    env: Entity<TextareaState>,
+    env_file: Entity<InputState>,
     schedule_state: Entity<ComboboxState<PickDelegate>>,
     schedule_ix: usize,
     times: Entity<InputState>,
@@ -156,6 +161,10 @@ impl TaskDialogView {
         let name = Self::new_input(window, cx, "任务名称");
         let path = Self::new_input(window, cx, "脚本绝对路径(如 E:\\work\\run.bat)");
         let manual_cmd = Self::new_input(window, cx, "手工命令,{script} 代表脚本路径");
+        let args = Self::new_textarea(window, cx, "每行一个参数,空行忽略");
+        let working_dir = Self::new_input(window, cx, "留空则使用脚本所在目录");
+        let env = Self::new_textarea(window, cx, "每行一个 KEY=VALUE,空行和 # 注释忽略");
+        let env_file = Self::new_input(window, cx, ".env 文件路径(可选)");
         let times = Self::new_input(window, cx, "多个时间用逗号分隔,如 08:00:00,12:30:00");
         let day = Self::new_input(window, cx, "1–31");
         let pattern = Self::new_textarea(window, cx, "每行一个候选模式;留空=核心内容一致");
@@ -172,6 +181,25 @@ impl TaskDialogView {
             }
             if let ScriptKind::Manual { command } = &t.script.kind {
                 manual_cmd.update(cx, |st, cx| st.set_value(command.clone(), window, cx));
+            }
+            args.update(cx, |st, cx| {
+                st.set_value(t.script.args.join("\n"), window, cx)
+            });
+            if let Some(value) = &t.script.working_dir {
+                working_dir.update(cx, |st, cx| st.set_value(value.clone(), window, cx));
+            }
+            if !t.script.env.is_empty() {
+                let text = t
+                    .script
+                    .env
+                    .iter()
+                    .map(|(key, value)| format!("{key}={value}"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                env.update(cx, |st, cx| st.set_value(text, window, cx));
+            }
+            if let Some(value) = &t.script.env_file {
+                env_file.update(cx, |st, cx| st.set_value(value.clone(), window, cx));
             }
             times.update(cx, |st, cx| {
                 let joined = t
@@ -247,6 +275,10 @@ impl TaskDialogView {
             kind_state,
             kind_ix,
             manual_cmd,
+            args,
+            working_dir,
+            env,
+            env_file,
             schedule_state,
             schedule_ix,
             times,
@@ -293,6 +325,10 @@ impl TaskDialogView {
             path: self.path.read(cx).value().to_string(),
             kind_ix: self.kind_ix,
             manual_cmd: self.manual_cmd.read(cx).value().to_string(),
+            args: self.args.read(cx).value().to_string(),
+            working_dir: self.working_dir.read(cx).value().to_string(),
+            env: self.env.read(cx).value().to_string(),
+            env_file: self.env_file.read(cx).value().to_string(),
             schedule_ix: self.schedule_ix,
             times: self.times.read(cx).value().to_string(),
             day: self.day.read(cx).value().to_string(),
@@ -315,6 +351,50 @@ impl TaskDialogView {
             prompt: Some("选择脚本文件".into()),
         });
         let path_input = self.path.clone();
+        let handle = self.handle;
+        cx.spawn(async move |cx| {
+            if let Ok(Ok(Some(paths))) = rx.await
+                && let Some(p) = paths.first()
+            {
+                let text = p.to_string_lossy().into_owned();
+                let _ = handle.update(cx, |_, window, cx| {
+                    path_input.update(cx, |st, cx| st.set_value(text, window, cx));
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn browse_working_dir(&mut self, cx: &mut App) {
+        let rx = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("选择工作目录".into()),
+        });
+        let path_input = self.working_dir.clone();
+        let handle = self.handle;
+        cx.spawn(async move |cx| {
+            if let Ok(Ok(Some(paths))) = rx.await
+                && let Some(p) = paths.first()
+            {
+                let text = p.to_string_lossy().into_owned();
+                let _ = handle.update(cx, |_, window, cx| {
+                    path_input.update(cx, |st, cx| st.set_value(text, window, cx));
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn browse_env_file(&mut self, cx: &mut App) {
+        let rx = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("选择 .env 文件".into()),
+        });
+        let path_input = self.env_file.clone();
         let handle = self.handle;
         cx.spawn(async move |cx| {
             if let Ok(Ok(Some(paths))) = rx.await
