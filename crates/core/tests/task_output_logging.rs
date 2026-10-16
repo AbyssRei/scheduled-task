@@ -53,6 +53,10 @@ fn task(id: u64, kind: ScriptKind, script: String) -> TaskConfig {
         script: ScriptSpec {
             kind,
             source: ScriptSource::Inline(script),
+            args: Vec::new(),
+            working_dir: None,
+            env: Default::default(),
+            env_file: None,
         },
         schedule: Schedule::Monthly {
             day: DayOfMonth::new(1).unwrap(),

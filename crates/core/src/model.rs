@@ -4,6 +4,7 @@
 //! 可选字段通过 serde default 提供默认值。
 //! 运行时状态(status)不在此模型中——由 [`crate::state::TaskStateManager`] 持有。
 
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use jiff::civil::Time;
@@ -133,6 +134,18 @@ impl DayOfMonth {
 pub struct ScriptSpec {
     pub kind: ScriptKind,
     pub source: ScriptSource,
+    /// 传给脚本或手工命令的参数,按 token 保持顺序,不经过 shell 再解析。
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// 工作目录;相对路径按脚本所在目录解析,为空时使用脚本所在目录。
+    #[serde(default)]
+    pub working_dir: Option<String>,
+    /// 显式环境变量,优先级高于 env_file,空值表示设置为空字符串。
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    /// dotenv 文件路径;相对路径按最终工作目录解析。
+    #[serde(default)]
+    pub env_file: Option<String>,
 }
 
 /// 脚本类型与解释器选择。

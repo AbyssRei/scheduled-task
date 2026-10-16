@@ -71,6 +71,10 @@ fn detached_runner() {
             &ScriptSpec {
                 kind: kind.clone(),
                 source: ScriptSource::Inline(content),
+                args: Vec::new(),
+                working_dir: None,
+                env: Default::default(),
+                env_file: None,
             },
             RunOptions {
                 timeout: Some(Duration::from_secs(15)),

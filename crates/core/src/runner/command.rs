@@ -1,5 +1,6 @@
 //! 脚本落盘、路径规范化与解析器启动命令构建。
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -91,6 +92,7 @@ pub(super) struct ResolvedCommand {
     /// 启动后向 stdin 喂一个换行(自动应答 `pause`)
     pub(super) feed_newline_stdin: bool,
     pub(super) working_dir: Option<PathBuf>,
+    pub(super) environment: BTreeMap<String, String>,
     /// 命令持有临时文件直到执行与输出读取全部完成。
     temp_file: Option<PathBuf>,
 }
@@ -121,6 +123,7 @@ pub(super) fn resolve(spec: &ScriptSpec) -> Result<ResolvedCommand, RunnerError>
         args: Vec::new(),
         feed_newline_stdin: false,
         working_dir,
+        environment: BTreeMap::new(),
         temp_file: matches!(spec.source, ScriptSource::Inline(_)).then(|| path.clone()),
     };
 
@@ -207,7 +210,116 @@ pub(super) fn resolve(spec: &ScriptSpec) -> Result<ResolvedCommand, RunnerError>
         // exe / 未知扩展:直接执行
         ScriptKind::Auto => {}
     }
+
+    // 脚本类型先构造解释器参数,任务参数再逐个追加,避免重新经过 shell 解析。
+    cmd.args.extend(spec.args.iter().cloned());
+
+    let script_dir = cmd.working_dir.clone();
+    if let Some(value) = spec
+        .working_dir
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        let path = PathBuf::from(value.trim());
+        let path = if path.is_absolute() {
+            path
+        } else {
+            script_dir
+                .clone()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join(path)
+        };
+        cmd.working_dir = Some(normalize_separators(path));
+    }
+
+    if let Some(value) = spec
+        .env_file
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        let path = PathBuf::from(value.trim());
+        let path = if path.is_absolute() {
+            path
+        } else {
+            cmd.working_dir
+                .clone()
+                .or(script_dir)
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join(path)
+        };
+        let text = std::fs::read_to_string(&path).map_err(|error| {
+            RunnerError::Resolve(format!("读取 .env 文件失败 {}: {error}", path.display()))
+        })?;
+        cmd.environment = parse_env_file(&text)?;
+    }
+    for (key, value) in &spec.env {
+        let key = key.trim();
+        validate_env_pair(key, value)?;
+        insert_environment(&mut cmd.environment, key.to_owned(), value.clone());
+    }
     Ok(cmd)
+}
+
+fn validate_env_key(key: &str) -> Result<(), RunnerError> {
+    if key.trim().is_empty() || key.contains('=') || key.contains('\0') {
+        return Err(RunnerError::Resolve(format!("环境变量名无效: {key:?}")));
+    }
+    Ok(())
+}
+
+fn validate_env_pair(key: &str, value: &str) -> Result<(), RunnerError> {
+    validate_env_key(key)?;
+    if value.contains('\0') {
+        return Err(RunnerError::Resolve(format!(
+            "环境变量值包含 NUL 字符: {key}"
+        )));
+    }
+    Ok(())
+}
+
+fn insert_environment(values: &mut BTreeMap<String, String>, key: String, value: String) {
+    #[cfg(windows)]
+    {
+        // Windows 环境变量名不区分大小写,删除已有拼写后再写入,保证显式值覆盖 .env。
+        if let Some(existing) = values
+            .keys()
+            .find(|existing| existing.eq_ignore_ascii_case(&key))
+            .cloned()
+        {
+            values.remove(&existing);
+        }
+    }
+    values.insert(key, value);
+}
+
+fn parse_env_file(text: &str) -> Result<BTreeMap<String, String>, RunnerError> {
+    let mut values = BTreeMap::new();
+    for (line_no, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let line = line.strip_prefix("export ").unwrap_or(line).trim_start();
+        let Some((key, value)) = line.split_once('=') else {
+            return Err(RunnerError::Resolve(format!(
+                ".env 第 {} 行缺少 '='",
+                line_no + 1
+            )));
+        };
+        let key = key.trim();
+        validate_env_pair(key, value)?;
+        let value = value.trim();
+        let value = if value.len() >= 2
+            && ((value.starts_with('"') && value.ends_with('"'))
+                || (value.starts_with('\'') && value.ends_with('\'')))
+        {
+            &value[1..value.len() - 1]
+        } else {
+            value
+        };
+        insert_environment(&mut values, key.to_owned(), value.to_owned());
+    }
+    Ok(values)
 }
 
 #[cfg(windows)]
@@ -233,11 +345,19 @@ mod tests {
         let first = resolve(&ScriptSpec {
             kind: ScriptKind::Cmd,
             source: ScriptSource::Inline("echo first".into()),
+            args: Vec::new(),
+            working_dir: None,
+            env: Default::default(),
+            env_file: None,
         })
         .unwrap();
         let second = resolve(&ScriptSpec {
             kind: ScriptKind::Cmd,
             source: ScriptSource::Inline("echo second".into()),
+            args: Vec::new(),
+            working_dir: None,
+            env: Default::default(),
+            env_file: None,
         })
         .unwrap();
         let first_path = first.temp_file.clone().unwrap();

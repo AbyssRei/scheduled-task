@@ -21,6 +21,10 @@ fn temp_script(name: &str, content: &str) -> ScriptSpec {
     ScriptSpec {
         kind: ScriptKind::Auto,
         source: ScriptSource::File(path.to_string_lossy().into_owned()),
+        args: Vec::new(),
+        working_dir: None,
+        env: Default::default(),
+        env_file: None,
     }
 }
 
@@ -293,6 +297,10 @@ fn scenario_reconcile_resets_stuck_running_after_debounce() {
     let script = ScriptSpec {
         kind: ScriptKind::Auto,
         source: ScriptSource::File("never-executed.bat".into()),
+        args: Vec::new(),
+        working_dir: None,
+        env: Default::default(),
+        env_file: None,
     };
     let task = base_task(202, "卡死重置", script.clone());
     let (tx, _rx) = spawn_channel();
@@ -342,6 +350,10 @@ fn scenario_stop_when_executor_gone_finalizes() {
     let script = ScriptSpec {
         kind: ScriptKind::Auto,
         source: ScriptSource::File("never-executed.bat".into()),
+        args: Vec::new(),
+        working_dir: None,
+        env: Default::default(),
+        env_file: None,
     };
     let task = base_task(204, "停止兜底", script.clone());
     let (tx, _rx) = spawn_channel();
@@ -377,6 +389,10 @@ fn scenario_python_uv_launcher_resolves() {
             launcher: PyLauncher::Uv { project: None },
         },
         source: script.source,
+        args: Vec::new(),
+        working_dir: None,
+        env: Default::default(),
+        env_file: None,
     };
     let task = base_task(106, "uv拉起", script);
     let states = TaskStateManager::new();

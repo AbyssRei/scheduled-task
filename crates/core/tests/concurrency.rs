@@ -12,6 +12,10 @@ fn task(id: u64, policy: ConcurrencyPolicy) -> TaskConfig {
         script: ScriptSpec {
             kind: ScriptKind::Auto,
             source: ScriptSource::Inline("".into()),
+            args: Vec::new(),
+            working_dir: None,
+            env: Default::default(),
+            env_file: None,
         },
         schedule: Schedule::Custom { times: vec![] },
         retry: None,
@@ -108,6 +112,10 @@ mod lifecycle {
             source: ScriptSource::Inline(
                 "@echo off\r\necho started\r\nping 127.0.0.1 -n 2 >nul\r\nexit /b 0\r\n".into(),
             ),
+            args: Vec::new(),
+            working_dir: None,
+            env: Default::default(),
+            env_file: None,
         };
         task
     }

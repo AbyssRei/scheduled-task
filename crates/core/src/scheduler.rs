@@ -117,6 +117,10 @@ mod tests {
             script: ScriptSpec {
                 kind: ScriptKind::Auto,
                 source: ScriptSource::File("t.bat".into()),
+                args: Vec::new(),
+                working_dir: None,
+                env: Default::default(),
+                env_file: None,
             },
             schedule,
             retry: None,

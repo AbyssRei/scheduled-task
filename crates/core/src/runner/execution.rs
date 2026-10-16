@@ -32,6 +32,7 @@ pub fn run(spec: &ScriptSpec, opts: RunOptions) -> Result<RunOutcome, RunnerErro
     let mut command = Command::new(&resolved.program);
     command
         .args(&resolved.args)
+        .envs(&resolved.environment)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .stdin(if resolved.feed_newline_stdin {

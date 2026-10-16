@@ -201,6 +201,10 @@ mod tests {
                         },
                     },
                     source: ScriptSource::File("scripts/sync.py".into()),
+                    args: vec!["--profile".into(), "nightly".into()],
+                    working_dir: Some("data".into()),
+                    env: [("MODE".into(), "full".into())].into_iter().collect(),
+                    env_file: Some(".env".into()),
                 },
                 schedule: Schedule::Monthly {
                     day: crate::model::DayOfMonth::new(1).unwrap(),
@@ -227,6 +231,10 @@ mod tests {
         assert_eq!(back.log_level, LogLevel::Debug);
         assert_eq!(back.tasks[0].name, "每日同步");
         assert_eq!(back.tasks[0].timeout, Some(Duration::from_secs(30 * 60)));
+        assert_eq!(back.tasks[0].script.args, ["--profile", "nightly"]);
+        assert_eq!(back.tasks[0].script.working_dir.as_deref(), Some("data"));
+        assert_eq!(back.tasks[0].script.env.get("MODE"), Some(&"full".into()));
+        assert_eq!(back.tasks[0].script.env_file.as_deref(), Some(".env"));
     }
 
     #[test]
@@ -256,6 +264,10 @@ mod tests {
         assert!(t.enabled);
         assert!(t.retry.is_none());
         assert!(t.timeout.is_none());
+        assert!(t.script.args.is_empty());
+        assert!(t.script.working_dir.is_none());
+        assert!(t.script.env.is_empty());
+        assert!(t.script.env_file.is_none());
         // 未指定策略时使用 Parallel。
         assert_eq!(t.concurrency, crate::model::ConcurrencyPolicy::Parallel);
     }
