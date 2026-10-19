@@ -8,7 +8,7 @@
 use std::time::Duration;
 
 use scheduled_task_core::daemon::{Daemon, DaemonEvent, spawn_channel};
-use scheduled_task_core::logger::init_logging;
+use scheduled_task_core::logger::init_logging_with_settings;
 use scheduled_task_core::store::TaskStore;
 
 fn main() {
@@ -29,10 +29,6 @@ fn exit_with_logs(code: i32) -> ! {
 }
 
 fn run(config_path: &str, only_task: Option<&str>) {
-    if let Err(e) = init_logging(std::path::Path::new("logs")) {
-        eprintln!("初始化日志失败: {e}");
-        exit_with_logs(1);
-    }
     let store = TaskStore::new(config_path.into());
     let config = match store.load() {
         Ok(c) => c,
@@ -41,6 +37,14 @@ fn run(config_path: &str, only_task: Option<&str>) {
             exit_with_logs(1);
         }
     };
+    if let Err(e) = init_logging_with_settings(
+        std::path::Path::new("logs"),
+        config.log_retention,
+        config.log_timezone,
+    ) {
+        eprintln!("初始化日志失败: {e}");
+        exit_with_logs(1);
+    }
     if let Err(error) = scheduled_task_core::logger::set_log_level(config.log_level) {
         eprintln!("应用文件日志等级失败: {error}");
         exit_with_logs(1);

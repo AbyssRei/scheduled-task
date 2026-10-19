@@ -8,11 +8,29 @@ use gpui_kit::{
     ClickEvent, Context, InteractiveElement as _, IntoElement, ParentElement as _, Render,
     ScrollHandle, ScrollWheelEvent, StatefulInteractiveElement as _, Styled, div, px,
 };
+use jiff::Timestamp;
+use scheduled_task_core::logger::format_log_timestamp;
 
 const MAX_LOG_LINES: usize = 200;
 
+struct LogEntry {
+    received_at: Timestamp,
+    message: String,
+}
+
+impl LogEntry {
+    fn display(&self) -> String {
+        // 保留原始时刻,切换时区时重新显示;不解析或改写脚本正文中的时间。
+        format!(
+            "[{}] {}",
+            format_log_timestamp(self.received_at),
+            self.message
+        )
+    }
+}
+
 pub(super) struct LogPanel {
-    lines: VecDeque<String>,
+    lines: VecDeque<LogEntry>,
     scroll: ScrollHandle,
     /// 向上滚暂停，向下滚或点“回到最新”恢复。
     auto_follow: bool,
@@ -31,7 +49,10 @@ impl LogPanel {
     }
 
     pub(super) fn push_log(&mut self, line: String, cx: &mut Context<Self>) {
-        self.lines.push_back(line);
+        self.lines.push_back(LogEntry {
+            received_at: Timestamp::now(),
+            message: line,
+        });
         while self.lines.len() > MAX_LOG_LINES {
             self.lines.pop_front();
         }
@@ -79,7 +100,8 @@ impl Render for LogPanel {
                     .px_2()
                     // 行内容自由换行，长行不截断。
                     .child(
-                        v_flex().children(self.lines.iter().cloned().map(|line| div().child(line))),
+                        v_flex()
+                            .children(self.lines.iter().map(|line| div().child(line.display()))),
                     ),
             );
 
@@ -103,5 +125,25 @@ impl Render for LogPanel {
             div()
         };
         log_panel.child(actions)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn 日志重绘保留接收时刻和脚本中的原始时间() {
+        let received_at: Timestamp = "2026-10-19T00:00:00.123Z".parse().unwrap();
+        let entry = LogEntry {
+            received_at,
+            message: "[任务1] 脚本时间 2026-10-18T19:00:00-05:00".into(),
+        };
+        let first = entry.display();
+        assert_eq!(entry.display(), first);
+        let end = first.find(']').unwrap();
+        let rendered: Timestamp = first[1..end].parse().unwrap();
+        assert_eq!(rendered, received_at);
+        assert_eq!(&first[end + 2..], entry.message);
     }
 }

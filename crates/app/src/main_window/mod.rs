@@ -61,7 +61,11 @@ impl TaskListView {
     /// daemon 事件 → 视图更新(UI 线程,由 main 的事件循环驱动)。
     pub fn apply_event(&mut self, event: DaemonEvent, cx: &mut Context<Self>) {
         match event {
-            DaemonEvent::ConfigChanged => self.refresh_rows(cx),
+            DaemonEvent::ConfigChanged => {
+                self.refresh_rows(cx);
+                // 日志时区配置变更后,缓冲中的时间戳也使用新时区重新显示。
+                self.log_panel.update(cx, |_, cx| cx.notify());
+            }
             DaemonEvent::Status { id, status } => {
                 self.table.update(cx, |state, _| {
                     if let Some(row) = state.delegate_mut().rows.iter_mut().find(|r| r.id == id) {

@@ -9,7 +9,7 @@ use std::sync::Mutex;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::logger::LogLevel;
+use crate::logger::{LogLevel, LogRetention, LogTimeZone};
 use crate::model::TaskConfig;
 
 /// 配置文件顶层结构。
@@ -21,6 +21,12 @@ pub struct ConfigFile {
     /// 文件日志等级,未设置时为 INFO。
     #[serde(default)]
     pub log_level: LogLevel,
+    /// 文件日志存储限制,旧配置默认保留 7 天且不限制总大小。
+    #[serde(default)]
+    pub log_retention: LogRetention,
+    /// GUI 与文件日志共用时区,旧配置默认同步系统。
+    #[serde(default)]
+    pub log_timezone: LogTimeZone,
     pub tasks: Vec<TaskConfig>,
     /// 全局同时运行的最大任务数,至少为 1。
     #[serde(default = "default_max_parallel")]
@@ -53,6 +59,8 @@ impl Default for ConfigFile {
             config_version: CONFIG_VERSION,
             theme: None,
             log_level: LogLevel::default(),
+            log_retention: LogRetention::default(),
+            log_timezone: LogTimeZone::default(),
             tasks: Vec::new(),
             max_parallel: default_max_parallel(),
         }
@@ -110,10 +118,6 @@ impl TaskStore {
         *self.theme_setting.lock().unwrap()
     }
 
-    pub fn set_theme_setting(&self, setting: Option<ThemeSetting>) {
-        *self.theme_setting.lock().unwrap() = setting;
-    }
-
     /// 加载配置;文件不存在返回默认(空)配置。
     pub fn load(&self) -> Result<ConfigFile, StoreError> {
         if !self.path.exists() {
@@ -139,13 +143,41 @@ impl TaskStore {
         }
         let mut out = config.clone();
         out.config_version = CONFIG_VERSION;
-        out.theme = *self.theme_setting.lock().unwrap();
         let text = ron::ser::to_string_pretty(&out, ron::ser::PrettyConfig::default())
             .map_err(|e| StoreError::Emit(e.to_string()))?;
-        std::fs::write(&self.path, text)?;
+        atomic_write(&self.path, text.as_bytes())?;
+        *self.theme_setting.lock().unwrap() = out.theme;
         tracing::info!("任务配置已保存到 {}", self.path.display());
         Ok(())
     }
+}
+
+/// 先完整写入同目录临时文件再替换，写入失败不会截断已有配置。
+fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+    let temporary = path.with_file_name(format!(
+        ".scheduled-task-{}-{}.tmp",
+        std::process::id(),
+        NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+    ));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)?;
+    let result = (|| {
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        // std::fs::rename 在 Windows 使用允许替换已有文件的重命名操作。
+        std::fs::rename(&temporary, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
 }
 
 /// 从配置构造任务时的运行时初始化:按 enabled 归一化(防上次异常退出锁死状态)。
@@ -154,6 +186,14 @@ pub type LoadedTasks = Vec<TaskConfig>;
 
 /// 配置入口校验并发域与任务标识,防止手工编辑绕过表单约束。
 fn validate_config(config: &ConfigFile) -> Result<(), StoreError> {
+    config
+        .log_timezone
+        .validate()
+        .map_err(StoreError::InvalidConfig)?;
+    config
+        .log_retention
+        .validate()
+        .map_err(StoreError::InvalidConfig)?;
     if config.max_parallel == 0 {
         return Err(StoreError::InvalidConfig("最大并行数必须大于 0".into()));
     }
@@ -191,6 +231,12 @@ mod tests {
             max_parallel: 3,
             theme: None,
             log_level: LogLevel::Debug,
+            log_timezone: LogTimeZone::Custom("Asia/Shanghai".into()),
+            log_retention: LogRetention {
+                retention_days: 365,
+                size_limit_enabled: true,
+                max_size_mb: 5120,
+            },
             tasks: vec![TaskConfig {
                 id: crate::model::TaskId(1),
                 name: "每日同步".into(),
@@ -229,6 +275,8 @@ mod tests {
         assert_eq!(back.tasks.len(), 1);
         assert_eq!(back.max_parallel, 3);
         assert_eq!(back.log_level, LogLevel::Debug);
+        assert_eq!(back.log_retention, config.log_retention);
+        assert_eq!(back.log_timezone, config.log_timezone);
         assert_eq!(back.tasks[0].name, "每日同步");
         assert_eq!(back.tasks[0].timeout, Some(Duration::from_secs(30 * 60)));
         assert_eq!(back.tasks[0].script.args, ["--profile", "nightly"]);
@@ -261,6 +309,8 @@ mod tests {
         assert_eq!(t.id, crate::model::TaskId(7));
         assert_eq!(back.max_parallel, 1);
         assert_eq!(back.log_level, LogLevel::Info);
+        assert_eq!(back.log_retention, LogRetention::default());
+        assert_eq!(back.log_timezone, LogTimeZone::System);
         assert!(t.enabled);
         assert!(t.retry.is_none());
         assert!(t.timeout.is_none());
@@ -293,6 +343,168 @@ mod tests {
             ron::from_str::<ConfigFile>("(config_version: 2, tasks: [], log_level: verbose)")
                 .is_err()
         );
+    }
+
+    fn temporary_store() -> TaskStore {
+        static NEXT_FILE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        TaskStore::new(std::env::temp_dir().join(format!(
+            "scheduled-task-store-{}-{}.ron",
+            std::process::id(),
+            NEXT_FILE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        )))
+    }
+
+    #[test]
+    fn 保存以完整配置主题为准且校验失败保留原文件与缓存() {
+        let store = temporary_store();
+        let mut config = ConfigFile {
+            theme: Some(ThemeSetting::Dark),
+            ..Default::default()
+        };
+        store.save(&config).unwrap();
+        assert_eq!(store.theme_setting(), Some(ThemeSetting::Dark));
+        config.theme = Some(ThemeSetting::Light);
+        store.save(&config).unwrap();
+        assert_eq!(store.load().unwrap().theme, Some(ThemeSetting::Light));
+        let original = std::fs::read(store.path()).unwrap();
+        config.theme = Some(ThemeSetting::Dark);
+        config.max_parallel = 0;
+        assert!(store.save(&config).is_err());
+        assert_eq!(std::fs::read(store.path()).unwrap(), original);
+        assert_eq!(store.theme_setting(), Some(ThemeSetting::Light));
+        std::fs::remove_file(store.path()).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn 替换失败不会截断原配置或提前更新主题缓存() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let store = temporary_store();
+        let mut config = ConfigFile {
+            theme: Some(ThemeSetting::Light),
+            ..Default::default()
+        };
+        store.save(&config).unwrap();
+        let original = std::fs::read(store.path()).unwrap();
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(store.path())
+            .unwrap();
+        config.theme = Some(ThemeSetting::Dark);
+        config.max_parallel = 5;
+        assert!(store.save(&config).is_err());
+        assert_eq!(store.theme_setting(), Some(ThemeSetting::Light));
+        drop(lock);
+        assert_eq!(std::fs::read(store.path()).unwrap(), original);
+        std::fs::remove_file(store.path()).unwrap();
+    }
+
+    #[test]
+    fn saved_retention_survives_other_configuration_changes() {
+        let store = temporary_store();
+        let retention = LogRetention {
+            retention_days: 30,
+            size_limit_enabled: true,
+            max_size_mb: 2048,
+        };
+        let config = ConfigFile {
+            log_retention: retention,
+            log_timezone: LogTimeZone::Custom("America/New_York".into()),
+            ..Default::default()
+        };
+        store.save(&config).unwrap();
+        let mut loaded = store.load().unwrap();
+        assert_eq!(loaded.log_retention, retention);
+        loaded.log_level = LogLevel::Debug;
+        loaded.max_parallel = 4;
+        loaded.theme = Some(ThemeSetting::Dark);
+        store.save(&loaded).unwrap();
+        let updated = store.load().unwrap();
+        assert_eq!(updated.log_retention, retention);
+        assert_eq!(updated.log_timezone, config.log_timezone);
+        assert_eq!(updated.theme, Some(ThemeSetting::Dark));
+        assert_eq!(updated.log_level, LogLevel::Debug);
+        assert_eq!(updated.max_parallel, 4);
+        std::fs::remove_file(store.path()).unwrap();
+    }
+
+    #[test]
+    fn 日志时区配置往返并保持其他设置() {
+        let store = temporary_store();
+        let mut config = ConfigFile {
+            log_level: LogLevel::Trace,
+            log_retention: LogRetention {
+                retention_days: 90,
+                size_limit_enabled: true,
+                max_size_mb: 4096,
+            },
+            max_parallel: 3,
+            ..Default::default()
+        };
+        config.theme = Some(ThemeSetting::Light);
+        for timezone in [
+            LogTimeZone::Custom("Asia/Shanghai".into()),
+            LogTimeZone::Custom("America/New_York".into()),
+            LogTimeZone::System,
+        ] {
+            config.log_timezone = timezone.clone();
+            store.save(&config).unwrap();
+            let loaded = store.load().unwrap();
+            assert_eq!(loaded.log_timezone, timezone);
+            assert_eq!(loaded.log_level, config.log_level);
+            assert_eq!(loaded.log_retention, config.log_retention);
+            assert_eq!(loaded.max_parallel, config.max_parallel);
+            assert_eq!(loaded.theme, Some(ThemeSetting::Light));
+        }
+        std::fs::remove_file(store.path()).unwrap();
+    }
+
+    #[test]
+    fn 日志时区在加载及保存时拒绝非法值() {
+        let store = temporary_store();
+        for name in ["", "Invalid/Timezone", "Asia/Not_A_Zone"] {
+            let config = ConfigFile {
+                log_timezone: LogTimeZone::Custom(name.into()),
+                ..Default::default()
+            };
+            assert!(matches!(
+                store.save(&config),
+                Err(StoreError::InvalidConfig(_))
+            ));
+            // 手工编辑配置也不能绕过时区校验。
+            std::fs::write(store.path(), ron::ser::to_string(&config).unwrap()).unwrap();
+            assert!(matches!(store.load(), Err(StoreError::InvalidConfig(_))));
+        }
+        std::fs::remove_file(store.path()).unwrap();
+    }
+
+    #[test]
+    fn retention_limits_are_validated_on_load_and_save() {
+        let store = temporary_store();
+        for (days, size, valid) in [
+            (3, 200, true),
+            (365, 5120, true),
+            (2, 1024, false),
+            (366, 1024, false),
+            (7, 199, false),
+            (7, 5121, false),
+        ] {
+            let config = ConfigFile {
+                log_retention: LogRetention {
+                    retention_days: days,
+                    size_limit_enabled: false,
+                    max_size_mb: size,
+                },
+                ..Default::default()
+            };
+            assert_eq!(store.save(&config).is_ok(), valid);
+            // 手工修改 RON 也必须通过相同边界校验,未启用大小限制不放宽存储值范围。
+            std::fs::write(store.path(), ron::ser::to_string(&config).unwrap()).unwrap();
+            assert_eq!(store.load().is_ok(), valid);
+        }
+        std::fs::remove_file(store.path()).unwrap();
     }
 
     #[test]

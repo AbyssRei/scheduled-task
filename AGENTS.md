@@ -26,7 +26,7 @@ Windows 桌面定时任务管理器，使用 Rust + GPUI Kit。支持每日、�
   - `scheduler.rs`：本地时间调度和 FireTracker 当日去重。
   - `store.rs`：`%APPDATA%\scheduled-task\tasks.ron` 读写。
   - `daemon.rs`：原子准入、执行上限、组互斥和有界队列。
-  - `logger.rs`、`logger/daily.rs`：控制台和文件默认 INFO，文件等级即时调整并持久化；按 UTC 日追加、按日期保留 5 个日志并保护当前文件，退出时显式刷写，无单文件大小限制。
+  - `logger.rs`、`logger/daily.rs`、`logger/timezone.rs`：控制台和文件默认 INFO，文件等级、统一日志时区及存储限制即时调整并持久化；时区默认跟随系统，可选 IANA 名称或固定偏移，GUI 时间前缀和文件时间戳、按天轮转及清理共用时区；默认保留 7 天（可设 3–365 天），可选总大小限制 200–5120 MB（默认关闭，默认值 1024 MB），最早日志优先清理并保护当前文件，退出时显式刷写。
 - `crates/core/tests/`：真实脚本执行及并发队列集成测试。
 - `crates/cli/`：无头调度与立即执行入口；`testdata/` 含示例配置和脚本。
 - `crates/keepalive/`：无 UI 的管理器保活、独立 `--watchdog` 入口、单实例和 Windows 计划任务集成；使用说明见 `docs/KEEPALIVE.md`。
@@ -34,7 +34,7 @@ Windows 桌面定时任务管理器，使用 Rust + GPUI Kit。支持每日、�
   - `main.rs`、`desktop.rs`：启动、事件循环、托盘和原生窗口显隐。
   - `main_window/`：主窗口、表格、工具栏、任务操作和独立日志视图。
   - `task_dialog/`：对话框生命周期、纯表单转换校验和布局。
-  - `settings_view.rs`：主窗口内设置对话框及主题应用。
+  - `settings_view.rs`、`settings_view/form.rs`：同级常规设置、任务运行与日志设置页面，固定导航及统一保存栏，跨页草稿校验；管理器保活独立即时生效。
   - `bridge.rs`：核心桥接和配置变更的统一处理。
 - `scripts/build.bat`、`scripts/build.ps1`：构建与打包。
 - `crates/app/assets/`：应用图标。
@@ -47,6 +47,7 @@ Windows 桌面定时任务管理器，使用 Rust + GPUI Kit。支持每日、�
 - 所有触发共用 `Daemon::admit_locked()` 原子准入决策，包括公开 `admit()`；每个 TaskId 单实例、最多一个等待项，重试冷却仍占执行槽位。
 - UI 事件上行：std mpsc → 转发线程 → async-channel → `cx.spawn` 内 `.await`；命令下行直接调用 `bridge::AppCore`。
 - 配置变更统一经 `AppCore::commit_task_changes()` 执行重载、保存及界面通知。`reload_preserving` 保留运行族状态和仍有效的当日触发标记。
+- 普通应用设置经 `AppCore::save_settings()` 统一校验、原子保存及生效，不重载任务；日志清理在持久化成功后执行，保活继续独立异步操作。
 - 管理器保活与任务重试分离：watchdog 不加载或执行任务；所有恢复入口遵守持久化开关。重启不恢复内存队列、不重跑中断任务、不补跑已过计划时刻。
 - 保活测试使用临时状态和模拟系统适配层；未经明确要求，不得在开发机注册真实计划任务或启动真实配置中的任务。
 - 交付前必须通过全部测试和零警告静态检查。模拟测试和程序启动不能代替真实桌面交互、登录、注销或关机验收。

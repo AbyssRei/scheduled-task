@@ -60,16 +60,21 @@ fn main() {
         return;
     }
 
-    // 日志:CWD logs/,默认 INFO;核心加载配置后应用保存的文件日志等级。
-    let _ = scheduled_task_core::logger::init_logging(std::path::Path::new("logs"));
+    let (event_tx, event_rx) = std::sync::mpsc::channel::<DaemonEvent>();
+    let daemon = Arc::new(Daemon::new(event_tx));
+    // 核心先读取配置,再按持久化的存储限制初始化 CWD logs/。
+    let core = match AppCore::init(daemon.clone()) {
+        Ok(core) => core,
+        Err(error) => {
+            show_startup_error(&error);
+            scheduled_task_core::logger::shutdown_logging();
+            return;
+        }
+    };
 
     if let Err(error) = scheduled_task_keepalive::ensure_watchdog() {
         tracing::error!("无法启动保活守护：{error}");
     }
-
-    let (event_tx, event_rx) = std::sync::mpsc::channel::<DaemonEvent>();
-    let daemon = Arc::new(Daemon::new(event_tx));
-    let core = AppCore::init(daemon.clone()).expect("初始化应用核心失败");
 
     // 事件上行:std mpsc → async-channel
     let (async_tx, async_rx) = async_channel::unbounded::<DaemonEvent>();
