@@ -1,50 +1,181 @@
-//! 按 UTC 日期追加日志,清理时始终保护当前文件。
+//! 按记录时间戳的当地日期追加日志,清理时始终保护当前文件。
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
+use super::LogRetention;
+use super::timezone::SharedTimeZone;
 use jiff::civil::Date;
-use jiff::tz::TimeZone;
 
-const MAX_LOG_FILES: usize = 5;
+const DIRECTORY_RECHECK_INTERVAL: Duration = Duration::from_secs(60);
 
-pub(super) struct DailyLogWriter {
+#[derive(Clone)]
+pub(super) struct SharedLogWriter {
+    writer: Arc<Mutex<DailyLogWriter>>,
+    timezone: SharedTimeZone,
+}
+
+impl SharedLogWriter {
+    pub(super) fn new(
+        directory: &Path,
+        retention: LogRetention,
+        timezone: SharedTimeZone,
+    ) -> io::Result<Self> {
+        let date = timezone.date(jiff::Timestamp::now());
+        Ok(Self {
+            writer: Arc::new(Mutex::new(DailyLogWriter::new_unpruned_at(
+                directory, date, retention,
+            )?)),
+            timezone,
+        })
+    }
+
+    pub(super) fn prune(&self) {
+        self.writer
+            .lock()
+            .unwrap()
+            .prune(self.timezone.date(jiff::Timestamp::now()));
+    }
+
+    pub(super) fn set_retention(&self, retention: LogRetention) {
+        self.writer
+            .lock()
+            .unwrap()
+            .set_retention_at(retention, self.timezone.date(jiff::Timestamp::now()));
+    }
+
+    /// 同时切换时区和保留策略，防止后台写入使用新时区与旧限制组合清理。
+    pub(super) fn apply_settings(
+        &self,
+        timezone: Option<(super::LogTimeZone, jiff::tz::TimeZone)>,
+        retention: Option<LogRetention>,
+    ) {
+        let mut writer = self.writer.lock().unwrap();
+        if let Some((setting, zone)) = timezone {
+            self.timezone.set_resolved(setting, zone);
+        }
+        if let Some(retention) = retention {
+            writer.set_retention_at(retention, self.timezone.date(jiff::Timestamp::now()));
+        }
+    }
+}
+
+impl Write for SharedLogWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let mut writer = self.writer.lock().unwrap();
+        let today = self.timezone.date(jiff::Timestamp::now());
+        writer.write_record_at(bytes, today)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.writer.lock().unwrap().file.flush()
+    }
+}
+
+struct DailyLogWriter {
     directory: PathBuf,
     date: Date,
     file: File,
+    retention: LogRetention,
+    total_size: u64,
+    has_removable_logs: bool,
+    last_pruned: Instant,
+    oversize_reported: bool,
 }
 
 impl DailyLogWriter {
-    pub(super) fn new(directory: &Path) -> io::Result<Self> {
-        Self::new_at(directory, utc_date())
-    }
-
-    fn new_at(directory: &Path, date: Date) -> io::Result<Self> {
-        fs::create_dir_all(directory)?;
-        let file = open_log(directory, date)?;
-        let writer = Self {
-            directory: directory.to_owned(),
-            date,
-            file,
-        };
-        writer.prune();
+    #[cfg(test)]
+    fn new_at(directory: &Path, date: Date, retention: LogRetention) -> io::Result<Self> {
+        let mut writer = Self::new_unpruned_at(directory, date, retention)?;
+        writer.prune(date);
         Ok(writer)
     }
 
+    fn new_unpruned_at(directory: &Path, date: Date, retention: LogRetention) -> io::Result<Self> {
+        fs::create_dir_all(directory)?;
+        let file = open_log(directory, date)?;
+        Ok(Self {
+            directory: directory.to_owned(),
+            date,
+            file,
+            retention,
+            total_size: 0,
+            has_removable_logs: false,
+            last_pruned: Instant::now(),
+            oversize_reported: false,
+        })
+    }
+
+    fn set_retention_at(&mut self, retention: LogRetention, date: Date) {
+        self.retention = retention;
+        self.prune(date);
+    }
+
+    fn size_limit(&self) -> Option<u64> {
+        self.retention
+            .size_limit_enabled
+            .then_some(u64::from(self.retention.max_size_mb) * 1024 * 1024)
+    }
+
+    fn write_record_at(&mut self, bytes: &[u8], today: Date) -> io::Result<usize> {
+        // tracing 每次提交一条完整格式化记录。排队期间跨日或切换时区时，
+        // 必须按记录自身的日期归档，不能用后台线程写入时的日期替代。
+        let date = record_date(bytes).unwrap_or(today);
+        self.write_with_dates(bytes, date, today)
+    }
+
+    #[cfg(test)]
     fn write_at(&mut self, bytes: &[u8], date: Date) -> io::Result<usize> {
+        self.write_with_dates(bytes, date, date)
+    }
+
+    fn write_with_dates(&mut self, bytes: &[u8], date: Date, today: Date) -> io::Result<usize> {
         if self.date != date {
             // 新文件打开成功后才替换当前文件,失败时不清理任何日志。
             let file = open_log(&self.directory, date)?;
             self.file.flush()?;
             self.file = file;
             self.date = date;
-            self.prune();
+            self.prune(today);
         }
-        self.file.write(bytes)
+        // 完整写入一条记录，防止短写重试将缺少时间前缀的后半段写入另一日文件。
+        self.file.write_all(bytes)?;
+        let written = bytes.len();
+        self.total_size = self.total_size.saturating_add(written as u64);
+        // 缓存目录总量,自身写入跨过上限时立即清理,无需逐行扫描目录。
+        // 定期复核兼顾其他进程写入以及上次删除失败的日志。
+        if self.last_pruned.elapsed() >= DIRECTORY_RECHECK_INTERVAL
+            || (self.has_removable_logs
+                && self
+                    .size_limit()
+                    .is_some_and(|limit| self.total_size > limit))
+        {
+            self.prune(today);
+        }
+        self.report_oversize();
+        Ok(written)
     }
 
-    fn prune(&self) {
+    fn report_oversize(&mut self) {
+        let oversized = self
+            .size_limit()
+            .is_some_and(|limit| self.total_size > limit);
+        if oversized && !self.oversize_reported {
+            eprintln!(
+                "日志存储超过大小限制,当前追加文件受到保护,无法删除的日志将在后续清理时重试: {}",
+                self.directory.display()
+            );
+        }
+        self.oversize_reported = oversized;
+    }
+
+    fn prune(&mut self, today: Date) {
+        self.last_pruned = Instant::now();
+        // 清理失败时等待下次定期复核,避免每条日志重复扫描和报错。
+        self.has_removable_logs = false;
         let entries = match fs::read_dir(&self.directory) {
             Ok(entries) => entries,
             Err(error) => {
@@ -74,39 +205,57 @@ impl DailyLogWriter {
             }
             let name = entry.file_name();
             if let Some(date) = name.to_str().and_then(log_date) {
-                logs.push((date, entry.path()));
+                // Windows 目录项可能尚未同步打开文件的长度,当前文件从句柄读取。
+                let metadata = if date == self.date {
+                    self.file.metadata()
+                } else {
+                    entry.metadata()
+                };
+                match metadata {
+                    Ok(metadata) => logs.push((date, entry.path(), metadata.len())),
+                    Err(error) => {
+                        eprintln!("读取日志大小失败 {}: {error}", entry.path().display());
+                    }
+                }
             }
         }
-        let mut excess = logs.len().saturating_sub(MAX_LOG_FILES);
-        logs.sort_unstable_by_key(|(date, _)| *date);
-        for (date, path) in logs {
-            if excess == 0 {
-                break;
-            }
+        let oldest = today
+            .checked_sub(jiff::Span::new().days(i64::from(self.retention.retention_days) - 1))
+            .unwrap_or(Date::MIN);
+        logs.sort_unstable_by_key(|(date, _, _)| *date);
+        self.total_size = logs.iter().map(|(_, _, size)| *size).sum();
+        let limit = self.size_limit();
+        let mut deletion_failed = false;
+        for (date, path, size) in logs {
             // 即使时钟回拨或存在未来日期日志,也不能删除正在追加的文件。
             if date == self.date {
                 continue;
             }
-            match fs::remove_file(&path) {
-                Ok(()) => excess -= 1,
-                Err(error) => eprintln!("清理旧日志失败 {}: {error}", path.display()),
+            if date < oldest || limit.is_some_and(|limit| self.total_size > limit) {
+                match fs::remove_file(&path) {
+                    Ok(()) => self.total_size = self.total_size.saturating_sub(size),
+                    Err(error) => {
+                        deletion_failed = true;
+                        eprintln!("清理旧日志失败 {}: {error}", path.display());
+                    }
+                }
+            } else {
+                self.has_removable_logs = true;
             }
         }
+        if deletion_failed && limit.is_some_and(|limit| self.total_size > limit) {
+            self.has_removable_logs = false;
+        }
+        self.report_oversize();
     }
 }
 
-impl Write for DailyLogWriter {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.write_at(bytes, utc_date())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.file.flush()
-    }
-}
-
-fn utc_date() -> Date {
-    jiff::Timestamp::now().to_zoned(TimeZone::UTC).date()
+fn record_date(bytes: &[u8]) -> Option<Date> {
+    let timestamp =
+        std::str::from_utf8(bytes.split(|byte| byte.is_ascii_whitespace()).next()?).ok()?;
+    // 先验证整个时间戳，避免误将普通消息中恰好出现的日期作为归档依据。
+    timestamp.parse::<jiff::Timestamp>().ok()?;
+    timestamp.get(..10)?.parse().ok()
 }
 
 fn log_name(date: Date) -> String {
@@ -171,6 +320,13 @@ mod tests {
             fs::read_to_string(self.0.join(log_name(date))).unwrap()
         }
 
+        fn seed_size(&self, date: Date, size: u64) {
+            File::create(self.0.join(log_name(date)))
+                .unwrap()
+                .set_len(size)
+                .unwrap();
+        }
+
         fn log_count(&self) -> usize {
             fs::read_dir(&self.0)
                 .unwrap()
@@ -187,17 +343,24 @@ mod tests {
         }
     }
 
+    fn retention(days: u16) -> LogRetention {
+        LogRetention {
+            retention_days: days,
+            ..LogRetention::default()
+        }
+    }
+
     fn day(day: i8) -> Date {
         Date::new(2026, 10, day).unwrap()
     }
 
     fn write_at(writer: &mut DailyLogWriter, text: &str, date: Date) {
         assert_eq!(writer.write_at(text.as_bytes(), date).unwrap(), text.len());
-        writer.flush().unwrap();
+        writer.file.flush().unwrap();
     }
 
     #[test]
-    fn 同日反复重启追加且五个文件不会减少() {
+    fn 同日反复重启追加且五天文件不会减少() {
         let directory = TestDirectory::new();
         // 当天文件最先创建,保留决策仍应只依据日志日期。
         directory.seed(day(15), "启动前\n");
@@ -205,7 +368,7 @@ mod tests {
             directory.seed(day(value), "历史\n");
         }
         for _ in 0..3 {
-            let mut writer = DailyLogWriter::new_at(&directory.0, day(15)).unwrap();
+            let mut writer = DailyLogWriter::new_at(&directory.0, day(15), retention(5)).unwrap();
             write_at(&mut writer, "重启后\n", day(15));
             drop(writer);
             assert_eq!(directory.log_count(), 5);
@@ -222,7 +385,7 @@ mod tests {
         for value in (11..=15).rev() {
             directory.seed(day(value), "历史\n");
         }
-        let mut writer = DailyLogWriter::new_at(&directory.0, day(15)).unwrap();
+        let mut writer = DailyLogWriter::new_at(&directory.0, day(15), retention(5)).unwrap();
         write_at(&mut writer, "次日\n", day(16));
         assert_eq!(directory.log_count(), 5);
         assert!(!directory.0.join(log_name(day(11))).exists());
@@ -238,7 +401,7 @@ mod tests {
         for value in 12..=16 {
             directory.seed(day(value), "已有\n");
         }
-        let mut writer = DailyLogWriter::new_at(&directory.0, day(15)).unwrap();
+        let mut writer = DailyLogWriter::new_at(&directory.0, day(15), retention(5)).unwrap();
         write_at(&mut writer, "当天\n", day(15));
         write_at(&mut writer, "次日\n", day(16));
         assert_eq!(directory.log_count(), 5);
@@ -253,11 +416,11 @@ mod tests {
         for value in 15..=20 {
             directory.seed(day(value), "已有\n");
         }
-        let mut writer = DailyLogWriter::new_at(&directory.0, day(15)).unwrap();
+        let mut writer = DailyLogWriter::new_at(&directory.0, day(15), retention(5)).unwrap();
         write_at(&mut writer, "当前\n", day(15));
-        assert_eq!(directory.log_count(), 5);
+        assert_eq!(directory.log_count(), 6);
         assert_eq!(directory.read(day(15)), "已有\n当前\n");
-        assert!(!directory.0.join(log_name(day(16))).exists());
+        assert_eq!(directory.log_count(), 6);
         for value in 17..=20 {
             assert_eq!(directory.read(day(value)), "已有\n");
         }
@@ -286,7 +449,7 @@ mod tests {
         for value in 10..=15 {
             directory.seed(day(value), "历史");
         }
-        let writer = DailyLogWriter::new_at(&directory.0, day(15)).unwrap();
+        let writer = DailyLogWriter::new_at(&directory.0, day(15), retention(5)).unwrap();
         assert_eq!(directory.log_count(), 5);
         assert!(!directory.0.join(log_name(day(10))).exists());
         for name in unrelated {
@@ -306,12 +469,169 @@ mod tests {
             directory.seed(day(value), "历史\n");
         }
         fs::create_dir(directory.0.join(log_name(day(16)))).unwrap();
-        let mut writer = DailyLogWriter::new_at(&directory.0, day(15)).unwrap();
+        let mut writer = DailyLogWriter::new_at(&directory.0, day(15), retention(5)).unwrap();
         assert!(writer.write_at(b"next", day(16)).is_err());
         assert_eq!(directory.log_count(), 5);
         assert_eq!(writer.date, day(15));
         write_at(&mut writer, "继续\n", day(15));
         assert_eq!(directory.read(day(15)), "历史\n继续\n");
         assert_eq!(directory.read(day(11)), "历史\n");
+    }
+
+    #[test]
+    fn 默认按七天实际年龄清理而非文件数量() {
+        let directory = TestDirectory::new();
+        directory.seed(day(1), "很早\n");
+        directory.seed(day(8), "过期\n");
+        directory.seed(day(9), "边界\n");
+        let writer =
+            DailyLogWriter::new_at(&directory.0, day(15), LogRetention::default()).unwrap();
+        assert_eq!(directory.log_count(), 2);
+        assert_eq!(directory.read(day(9)), "边界\n");
+        assert!(!directory.0.join(log_name(day(8))).exists());
+        drop(writer);
+    }
+
+    #[test]
+    fn 动态缩短保留天数立即清理且扩展后允许更多历史() {
+        let directory = TestDirectory::new();
+        for value in 9..=15 {
+            directory.seed(day(value), "历史\n");
+        }
+        let mut writer =
+            DailyLogWriter::new_at(&directory.0, day(15), LogRetention::default()).unwrap();
+        writer.set_retention_at(retention(3), day(15));
+        assert_eq!(directory.log_count(), 3);
+        assert!(directory.0.join(log_name(day(13))).exists());
+        directory.seed(day(9), "新增历史\n");
+        writer.set_retention_at(retention(7), day(15));
+        assert_eq!(directory.read(day(9)), "新增历史\n");
+    }
+
+    fn size_limited() -> LogRetention {
+        LogRetention {
+            size_limit_enabled: true,
+            max_size_mb: 200,
+            ..LogRetention::default()
+        }
+    }
+
+    #[test]
+    fn 大小默认不限制且启用后立即按日期移除最早日志() {
+        let directory = TestDirectory::new();
+        for value in [14, 12, 13] {
+            directory.seed_size(day(value), 100 * 1024 * 1024);
+        }
+        let mut writer =
+            DailyLogWriter::new_at(&directory.0, day(15), LogRetention::default()).unwrap();
+        assert_eq!(directory.log_count(), 4);
+        writer.set_retention_at(size_limited(), day(15));
+        assert_eq!(directory.log_count(), 3);
+        assert!(!directory.0.join(log_name(day(12))).exists());
+        assert_eq!(writer.total_size, 200 * 1024 * 1024);
+        writer.set_retention_at(LogRetention::default(), day(15));
+        directory.seed_size(day(12), 100 * 1024 * 1024);
+        writer.prune(day(15));
+        assert_eq!(directory.log_count(), 4);
+    }
+
+    #[test]
+    fn 持续写入跨过总大小上限即清理() {
+        let directory = TestDirectory::new();
+        directory.seed_size(day(14), 100 * 1024 * 1024);
+        directory.seed_size(day(15), 100 * 1024 * 1024);
+        let mut writer = DailyLogWriter::new_at(&directory.0, day(15), size_limited()).unwrap();
+        assert_eq!(directory.log_count(), 2);
+        write_at(&mut writer, "a", day(15));
+        assert_eq!(directory.log_count(), 1);
+        assert_eq!(writer.total_size, 100 * 1024 * 1024 + 1);
+        assert!(!directory.0.join(log_name(day(14))).exists());
+    }
+
+    #[test]
+    fn 当前文件独自超限仍保留且不会每条日志扫描目录() {
+        let directory = TestDirectory::new();
+        directory.seed_size(day(15), 201 * 1024 * 1024);
+        directory.seed(day(16), "未来\n");
+        let mut writer = DailyLogWriter::new_at(&directory.0, day(15), size_limited()).unwrap();
+        assert_eq!(directory.log_count(), 1);
+        assert!(writer.oversize_reported);
+        let last_pruned = writer.last_pruned;
+        write_at(&mut writer, "a", day(15));
+        assert_eq!(writer.last_pruned, last_pruned);
+        assert!(directory.0.join(log_name(day(15))).exists());
+        // 次日旧文件不再受保护,可立即释放容量。
+        write_at(&mut writer, "b", day(16));
+        assert!(!directory.0.join(log_name(day(15))).exists());
+        assert_eq!(directory.read(day(16)), "b");
+    }
+
+    #[test]
+    fn 定期复核其他进程新增日志() {
+        let directory = TestDirectory::new();
+        let mut writer = DailyLogWriter::new_at(&directory.0, day(15), size_limited()).unwrap();
+        directory.seed_size(day(14), 201 * 1024 * 1024);
+        writer.last_pruned = Instant::now() - DIRECTORY_RECHECK_INTERVAL;
+        write_at(&mut writer, "a", day(15));
+        assert!(!directory.0.join(log_name(day(14))).exists());
+        assert_eq!(writer.total_size, 1);
+    }
+
+    #[test]
+    fn 跨月保留天数边界包含今天() {
+        let directory = TestDirectory::new();
+        directory.seed(day(30), "过期\n");
+        directory.seed(day(31), "边界\n");
+        let writer =
+            DailyLogWriter::new_at(&directory.0, Date::new(2026, 11, 2).unwrap(), retention(3))
+                .unwrap();
+        assert!(!directory.0.join(log_name(day(30))).exists());
+        assert_eq!(directory.read(day(31)), "边界\n");
+        drop(writer);
+    }
+
+    #[test]
+    fn 排队记录跨午夜或切换时区仍归入自身日期() {
+        let directory = TestDirectory::new();
+        let mut writer = DailyLogWriter::new_at(&directory.0, day(20), retention(7)).unwrap();
+        let previous = b"2026-10-19T23:59:59.123+08:00 INFO queued\n";
+        let current = b"2026-10-20T00:00:00.123+08:00 INFO current\n";
+        let changed = b"2026-10-18T22:00:00.123-12:00 INFO changed\n";
+        for record in [previous.as_slice(), current.as_slice(), changed.as_slice()] {
+            writer.write_record_at(record, day(20)).unwrap();
+        }
+        writer.file.flush().unwrap();
+        assert_eq!(directory.read(day(19)).as_bytes(), previous);
+        assert_eq!(directory.read(day(20)).as_bytes(), current);
+        assert_eq!(directory.read(day(18)).as_bytes(), changed);
+    }
+
+    #[test]
+    fn 延迟记录按当前日期清理但保护正在追加的历史文件() {
+        let directory = TestDirectory::new();
+        directory.seed(day(16), "过期\n");
+        let mut writer = DailyLogWriter::new_at(&directory.0, day(17), retention(3)).unwrap();
+        writer
+            .write_record_at(b"2026-10-15T23:59:59.000+08:00 INFO delayed\n", day(20))
+            .unwrap();
+        assert!(!directory.0.join(log_name(day(16))).exists());
+        assert!(directory.0.join(log_name(day(15))).exists());
+        assert!(!directory.0.join(log_name(day(17))).exists());
+    }
+
+    #[test]
+    fn 非时间戳内容不误识别为日期且完整多行记录不拆分() {
+        assert_eq!(record_date(b"2026-10-19 ordinary message"), None);
+        assert_eq!(
+            record_date(b"2026-10-19T99:00:00.000+08:00 INFO invalid"),
+            None
+        );
+        let directory = TestDirectory::new();
+        let mut writer = DailyLogWriter::new_at(&directory.0, day(20), retention(7)).unwrap();
+        let record =
+            "2026-10-19T23:59:59.000+08:00 INFO 首行\n2026-10-18T00:00:00.000Z 是消息正文\n";
+        writer.write_record_at(record.as_bytes(), day(20)).unwrap();
+        assert_eq!(directory.read(day(19)), record);
+        assert!(!directory.0.join(log_name(day(18))).exists());
     }
 }
