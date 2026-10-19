@@ -50,6 +50,14 @@ scripts\build.bat
 
 打包版本取自 workspace `Cargo.toml`，产物为 `dist/scheduled-task-v<版本>-dist/` 和同名 `.7z`；未安装 7z 时生成 `.zip`。发布程序名称固定为 `scheduled-task.exe`，包内附带使用说明、行为规格、保活说明和并发配置示例。也可运行 `pwsh -NoProfile -File scripts/build.ps1`，支持 `-SkipBuild` 和 `-NoZip`。
 
+## GitHub Actions 构建与发布
+
+[构建工作流](.github/workflows/build.yml) 在 `main` 推送、PR、`v*` 标签推送及手动运行时启动，使用 Windows x64 环境并从 `rust-toolchain.toml` 读取与本地一致的 Rust 工具链，依次执行 workspace 格式检查、零警告 Clippy、全量测试及 release 构建。工作流安装 uv 和测试用 Python，复用 `scripts/build.ps1 -SkipBuild` 打包，并验证 7z 压缩包；产物 `scheduled-task-windows-x64` 保留 30 天。
+
+发布时先更新 workspace 版本及 `Cargo.lock`。每次推送前确认仓库没有未完成的 Action；先单独推送主分支改动，等待该次流水线全部成功后，再单独推送与版本完全一致的标签，标签也必须等上一条 Action 结束后逐个推送。标签不匹配会终止检查；仅标签推送且 CI 全部通过后才创建 GitHub Release，上传 `scheduled-task-v<版本>-dist.7z` 并自动生成发布说明。包含 `-` 的版本标签标记为预发布。主分支、PR 和手动运行只生成构建产物。提交格式、版本增量和标签不可变规则见[版本约定](docs/VERSIONING.md)。
+
+所有直接使用的 Marketplace Action 仅固定大版本（2026-10-19 按官方发布页及实际 Git 引用核对）：[checkout@v7](https://github.com/actions/checkout/releases/latest)、[setup-rust-toolchain@v2](https://github.com/actions-rust-lang/setup-rust-toolchain/releases/latest)、[rust-cache@v2](https://github.com/Swatinem/rust-cache/releases/latest)、[setup-uv@v7](https://github.com/astral-sh/setup-uv/tree/v7)、[upload-artifact@v7](https://github.com/actions/upload-artifact/releases/latest)、[download-artifact@v8](https://github.com/actions/download-artifact/releases/latest)、[action-gh-release@v3](https://github.com/softprops/action-gh-release/releases/latest)。setup-uv 虽已发布 v10.3.0，但尚无 v10 大版本引用，因此使用当前可解析的最高大版本标签 v7。构建默认仅有仓库读取权限，只有发布任务获得 `contents: write`；无需另配个人访问令牌。自动测试不替代真实桌面交互验收。
+
 ## 项目结构
 
 | 模块 | 职责 |
@@ -70,13 +78,3 @@ scripts\build.bat
 管理器日志写入工作目录的 `logs/`，守护日志写入程序目录的 `logs/watchdog/`。文件日志默认 INFO，过滤 GPUI 等依赖的 DEBUG 调试输出。在“设置 → 常规设置 → 文件日志等级”选择 ERROR、WARN、INFO、DEBUG 或 TRACE，立即生效并保存；DEBUG 和 TRACE 适合临时排查问题，可能产生大量日志。此选项控制管理器文件日志，不影响界面中的任务输出；CLI 使用所加载配置的 `log_level`，守护文件日志保持 INFO。控制台默认 INFO，仍可用 `RUST_LOG` 单独调整。
 
 日志按 UTC 日期轮转（北京时间每天 08:00 切换），同一天重启继续追加。按文件名日期保留最多 5 个日志，清理时始终保留当前文件，不处理备份文件。正常退出会刷新后台待写日志；强制结束、崩溃或断电仍可能丢失未落盘部分。当前没有单文件大小上限，高输出任务仍可能产生较大的当天日志。界面日志面板仅保留最近 200 行，不影响文件日志。
-
-
-## GitHub Actions 构建与发布
-
-[构建工作流](.github/workflows/build.yml) 在 `main` 推送、PR、`v*` 标签推送及手动运行时启动，使用 Windows x64 环境并从 `rust-toolchain.toml` 读取与本地一致的 Rust 工具链，依次执行 workspace 格式检查、零警告 Clippy、全量测试及 release 构建。工作流安装 uv 和测试用 Python，复用 `scripts/build.ps1 -SkipBuild` 打包，并验证 7z 压缩包；产物 `scheduled-task-windows-x64` 保留 30 天。
-
-发布时先更新 workspace 版本及 `Cargo.lock`。每次推送前确认仓库没有未完成的 Action；先单独推送主分支改动，等待该次流水线全部成功后，再单独推送与版本完全一致的标签，标签也必须等上一条 Action 结束后逐个推送。标签不匹配会终止检查；仅标签推送且 CI 全部通过后才创建 GitHub Release，上传 `scheduled-task-v<版本>-dist.7z` 并自动生成发布说明。包含 `-` 的版本标签标记为预发布。主分支、PR 和手动运行只生成构建产物。提交格式、版本增量和标签不可变规则见[版本约定](docs/VERSIONING.md)。
-
-所有直接使用的 Marketplace Action 仅固定大版本（2026-10-19 按官方发布页及实际 Git 引用核对）：[checkout@v7](https://github.com/actions/checkout/releases/latest)、[setup-rust-toolchain@v2](https://github.com/actions-rust-lang/setup-rust-toolchain/releases/latest)、[rust-cache@v2](https://github.com/Swatinem/rust-cache/releases/latest)、[setup-uv@v7](https://github.com/astral-sh/setup-uv/tree/v7)、[upload-artifact@v7](https://github.com/actions/upload-artifact/releases/latest)、[download-artifact@v8](https://github.com/actions/download-artifact/releases/latest)、[action-gh-release@v3](https://github.com/softprops/action-gh-release/releases/latest)。setup-uv 虽已发布 v10.3.0，但尚无 v10 大版本引用，因此使用当前可解析的最高大版本标签 v7。构建默认仅有仓库读取权限，只有发布任务获得 `contents: write`；无需另配个人访问令牌。自动测试不替代真实桌面交互验收。
-

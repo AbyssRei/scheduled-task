@@ -13,7 +13,7 @@ use gpui_kit::component::theme::{Theme, ThemeMode};
 use gpui_kit::component::{ActiveTheme as _, Disableable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::{
     App, AppContext as _, ClickEvent, Context, Entity, InteractiveElement as _, IntoElement,
-    ParentElement as _, Render, StatefulInteractiveElement as _, Styled, Window, div, px,
+    ParentElement as _, Render, Styled, Window, div, px,
 };
 
 use scheduled_task_core::logger::LogLevel;
@@ -138,7 +138,7 @@ impl Render for SettingsView {
         let sidebar = div()
             .w(px(160.))
             .flex_shrink_0()
-            .h_full()
+            .self_stretch()
             .border_r_1()
             .border_color(cx.theme().border)
             .p_3()
@@ -161,13 +161,11 @@ impl Render for SettingsView {
             );
 
         // 右侧内容区:标题 / 分区说明 / 主题卡片
-        // h_flex 默认交叉轴居中:右栏需 h_full 顶满,内容才顶对齐
+        // 内容保持自然高度，由外层对话框统一限高并显示滚动条。
         let pane = v_flex()
             .id("settings-content")
             .flex_1()
-            .h_full()
             .min_w_0()
-            .overflow_y_scroll()
             .p_4()
             .gap_4()
             .child(div().text_size(px(22.)).child("常规设置"))
@@ -200,7 +198,7 @@ impl Render for SettingsView {
                                         .child("选择浅色、深色或跟随系统主题。"),
                                 ),
                             )
-                            .child(h_flex().gap_1().children(theme_buttons)),
+                            .child(h_flex().flex_wrap().gap_1().children(theme_buttons)),
                     ),
             )
             .child(
@@ -213,7 +211,7 @@ impl Render for SettingsView {
                             .text_color(cx.theme().muted_foreground)
                             .child("控制文件日志的详细程度,默认“信息”。任务输出面板不受影响。"),
                     )
-                    .child(h_flex().gap_1().children(log_level_buttons))
+                    .child(h_flex().flex_wrap().gap_1().children(log_level_buttons))
                     .child(
                         div()
                             .text_size(px(12.))
@@ -285,7 +283,8 @@ impl Render for SettingsView {
 
         h_flex()
             .w_full()
-            .h(px(590.))
+            .items_start()
+            .flex_shrink_0()
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
             .child(sidebar)
@@ -332,10 +331,7 @@ pub fn open_settings(core: Arc<AppCore>, window: &mut Window, cx: &mut App) {
     });
     window.open_dialog(cx, move |dialog, _, _| {
         let view = view.clone();
-        dialog
-            .title("设置")
-            .w(px(760.))
-            .content(move |content, _, _| content.child(view.clone()))
+        dialog.title("设置").w(px(760.)).child(view)
     });
 }
 

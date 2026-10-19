@@ -1,7 +1,8 @@
 //! 桌面集成:托盘菜单、主窗口句柄和原生窗口显隐。
 
 use gpui_kit::component::WindowExt as _;
-use gpui_kit::{App, Global, MenuItem, actions};
+use gpui_kit::component::dialog::DialogDescription;
+use gpui_kit::{App, Global, MenuItem, ParentElement as _, actions};
 use gpui_tray::Tray;
 use std::sync::atomic::{AtomicBool, Ordering};
 actions!(
@@ -130,7 +131,7 @@ fn show_keepalive_error(message: String, cx: &mut App) {
             window.open_alert_dialog(cx, move |alert, _, _| {
                 alert
                     .title("保活操作未完成")
-                    .description(message.clone())
+                    .child(DialogDescription::new().child(message.clone()))
                     .show_cancel(false)
             });
         });

@@ -14,6 +14,7 @@ use std::sync::Arc;
 
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::combobox::{ComboboxEvent, ComboboxState};
+use gpui_kit::component::dialog::DialogDescription;
 use gpui_kit::component::input::{InputState, TextareaState};
 use gpui_kit::{App, AppContext as _, Context, Entity, ParentElement as _, PathPromptOptions, px};
 use scheduled_task_core::model::{Schedule, ScriptKind, ScriptSource, TaskConfig, TaskId};
@@ -116,7 +117,9 @@ impl TaskDialogView {
             dialog
                 .title("添加任务")
                 .w(px(640.))
-                .content(move |content, _, _| content.child(view.clone()))
+                .footer(Self::actions(view.clone()))
+                // 使用对话框内置的限高滚动区，避免长表单超出窗口。
+                .child(view)
         });
     }
 
@@ -134,7 +137,8 @@ impl TaskDialogView {
             dialog
                 .title("编辑任务")
                 .w(px(640.))
-                .content(move |content, _, _| content.child(view.clone()))
+                .footer(Self::actions(view.clone()))
+                .child(view)
         });
     }
 
@@ -311,7 +315,10 @@ impl TaskDialogView {
                 let msg = msg.clone();
                 window.open_alert_dialog(cx, move |alert, _, _| {
                     let msg = msg.clone();
-                    alert.title("校验失败").description(msg).show_cancel(false)
+                    alert
+                        .title("校验失败")
+                        .child(DialogDescription::new().child(msg))
+                        .show_cancel(false)
                 });
             }
         }

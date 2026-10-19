@@ -6,7 +6,9 @@ use gpui_kit::component::combobox::Combobox;
 use gpui_kit::component::input::{Input, NumberInput, Textarea};
 use gpui_kit::component::{ActiveTheme as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder;
-use gpui_kit::{ClickEvent, Context, IntoElement, ParentElement as _, Render, Styled, div, px};
+use gpui_kit::{
+    ClickEvent, Context, Entity, IntoElement, ParentElement as _, Render, Styled, div, px,
+};
 
 use super::TaskDialogView;
 
@@ -28,6 +30,7 @@ impl Render for TaskDialogView {
         let theme_fg = cx.theme().foreground;
 
         v_flex()
+            .flex_shrink_0()
             .gap_3()
             .text_color(theme_fg)
             .child(field("任务名称", Input::new(&self.name).h(px(32.))))
@@ -164,21 +167,23 @@ impl Render for TaskDialogView {
                     .child(div().w(px(110.)).flex_shrink_0().child("超时(分钟)"))
                     .child(NumberInput::new(&self.timeout_min).w(px(110.))),
             )
-            .child(
-                h_flex()
-                    .justify_end()
-                    .gap_2()
-                    .child(Button::new("btn-cancel").label("取消").on_click({
-                        move |_: &ClickEvent, window, cx| {
-                            window.close_dialog(cx);
-                        }
-                    }))
-                    .child(Button::new("btn-save").label("保存").primary().on_click({
-                        let view = view.clone();
-                        move |_: &ClickEvent, window, cx| {
-                            view.update(cx, |this, cx| this.save(window, cx))
-                        }
-                    })),
-            )
+    }
+}
+
+impl TaskDialogView {
+    /// 操作按钮留在滚动区外，低分辨率下也能随时保存或取消。
+    pub(super) fn actions(view: Entity<Self>) -> impl IntoElement {
+        h_flex()
+            .flex_shrink_0()
+            .justify_end()
+            .gap_2()
+            .child(Button::new("btn-cancel").label("取消").on_click(
+                move |_: &ClickEvent, window, cx| {
+                    window.close_dialog(cx);
+                },
+            ))
+            .child(Button::new("btn-save").label("保存").primary().on_click(
+                move |_: &ClickEvent, window, cx| view.update(cx, |this, cx| this.save(window, cx)),
+            ))
     }
 }
