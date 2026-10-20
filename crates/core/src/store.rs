@@ -276,6 +276,52 @@ mod tests {
     }
 
     #[test]
+    fn 环境文件列表兼容旧配置并保留顺序且校验空路径() {
+        let store = temporary_store();
+        for (fields, expected) in [
+            ("", vec![]),
+            (r#"env_file: Some("legacy.env"),"#, vec!["legacy.env"]),
+            (
+                r#"env_files: ["base.env", "local.env", "base.env"],"#,
+                vec!["base.env", "local.env", "base.env"],
+            ),
+            (
+                r#"env_file: Some("legacy.env"), env_files: ["base.env", "local.env"],"#,
+                vec!["legacy.env", "base.env", "local.env"],
+            ),
+        ] {
+            let source = format!(
+                r#"(config_version: 2, tasks: [(
+                id: (1), name: "环境文件验证", script: (kind: cmd, source: inline("exit /b 0"), {fields}),
+                schedule: daily(times: ["08:00:00"])
+            )])"#
+            );
+            std::fs::write(store.path(), source).unwrap();
+            let config = store.load().unwrap();
+            assert_eq!(
+                config.tasks[0].script.env_file_paths().collect::<Vec<_>>(),
+                expected
+            );
+            store.save(&config).unwrap();
+            assert_eq!(
+                store.load().unwrap().tasks[0]
+                    .script
+                    .env_file_paths()
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            for invalid in ["", " \t", "nul\0path"] {
+                let mut config = config.clone();
+                config.tasks[0].script.env_files.push(invalid.into());
+                assert!(store.save(&config).is_err());
+                std::fs::write(store.path(), ron::ser::to_string(&config).unwrap()).unwrap();
+                assert!(store.load().is_err());
+            }
+        }
+        std::fs::remove_file(store.path()).unwrap();
+    }
+
+    #[test]
     fn ron_roundtrip_preserves_enum_shapes() {
         let config = ConfigFile {
             config_version: CONFIG_VERSION,
@@ -302,6 +348,7 @@ mod tests {
                     working_dir: Some("data".into()),
                     env: [("MODE".into(), "full".into())].into_iter().collect(),
                     env_file: Some(".env".into()),
+                    env_files: vec![".env.local".into(), "config/.env.secrets".into()],
                 },
                 schedule: Schedule::Monthly {
                     day: crate::model::DayOfMonth::new(1).unwrap(),
@@ -334,6 +381,10 @@ mod tests {
         assert_eq!(back.tasks[0].script.working_dir.as_deref(), Some("data"));
         assert_eq!(back.tasks[0].script.env.get("MODE"), Some(&"full".into()));
         assert_eq!(back.tasks[0].script.env_file.as_deref(), Some(".env"));
+        assert_eq!(
+            back.tasks[0].script.env_files,
+            vec![".env.local", "config/.env.secrets"]
+        );
     }
 
     #[test]
@@ -369,6 +420,7 @@ mod tests {
         assert!(t.script.working_dir.is_none());
         assert!(t.script.env.is_empty());
         assert!(t.script.env_file.is_none());
+        assert!(t.script.env_files.is_empty());
         // 未指定策略时使用 Parallel。
         assert_eq!(t.concurrency, crate::model::ConcurrencyPolicy::Parallel);
     }

@@ -75,6 +75,7 @@ fn detached_runner() {
                 working_dir: None,
                 env: Default::default(),
                 env_file: None,
+                env_files: Vec::new(),
             },
             RunOptions {
                 timeout: Some(Duration::from_secs(15)),

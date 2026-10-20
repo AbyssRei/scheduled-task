@@ -339,6 +339,7 @@ mod tests {
                         working_dir: None,
                         env: Default::default(),
                         env_file: None,
+                        env_files: Vec::new(),
                     },
                     schedule: Schedule::Daily {
                         times: vec!["23:59:59".parse().unwrap()],

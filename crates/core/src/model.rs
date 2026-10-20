@@ -47,6 +47,7 @@ pub struct TaskConfig {
 impl TaskConfig {
     /// 所有配置入口共享的领域约束，避免手工编辑绕过表单校验。
     pub fn validate(&self) -> Result<(), String> {
+        self.script.validate_env_files()?;
         if self.name.trim().is_empty() {
             return Err("任务名称不能为空".into());
         }
@@ -200,12 +201,37 @@ pub struct ScriptSpec {
     /// 工作目录;相对路径按脚本所在目录解析,为空时使用脚本所在目录。
     #[serde(default)]
     pub working_dir: Option<String>,
-    /// 显式环境变量,优先级高于 env_file,空值表示设置为空字符串。
+    /// 显式环境变量，优先级高于所有 .env 文件，空值表示设置为空字符串。
     #[serde(default)]
     pub env: BTreeMap<String, String>,
-    /// dotenv 文件路径;相对路径按最终工作目录解析。
+    /// 兼容旧配置的单文件入口，先于 env_files 加载；相对路径按最终工作目录解析。
     #[serde(default)]
     pub env_file: Option<String>,
+    /// 按顺序加载，后面的文件覆盖前面的同名变量。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub env_files: Vec<String>,
+}
+
+impl ScriptSpec {
+    pub fn env_file_paths(&self) -> impl Iterator<Item = &str> {
+        self.env_file
+            .iter()
+            .map(String::as_str)
+            .filter(|path| !path.trim().is_empty())
+            .chain(self.env_files.iter().map(String::as_str))
+    }
+
+    pub fn validate_env_files(&self) -> Result<(), String> {
+        for (index, path) in self.env_files.iter().enumerate() {
+            if path.trim().is_empty() || path.contains('\0') {
+                return Err(format!(
+                    "第 {} 个 .env 文件路径为空或包含无效字符",
+                    index + 1
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// 脚本类型与解释器选择。

@@ -56,7 +56,7 @@ fn command_options_reach_script_with_expected_precedence() {
             args: vec!["first value".into(), "second".into()],
             working_dir: Some(directory.path().to_string_lossy().into_owned()),
             env,
-            env_file: Some(".env".into()),
+            env_file: Some(".env".into()), env_files: Vec::new(),
         },
         RunOptions {
             timeout: Some(Duration::from_secs(10)),
@@ -101,6 +101,7 @@ fn invalid_dotenv_blocks_process_start() {
             working_dir: Some(directory.path().to_string_lossy().into_owned()),
             env: BTreeMap::new(),
             env_file: Some("invalid.env".into()),
+            env_files: Vec::new(),
         },
         RunOptions {
             timeout: Some(Duration::from_secs(10)),
@@ -113,6 +114,119 @@ fn invalid_dotenv_blocks_process_start() {
         error,
         RunnerError::Resolve(message) if message.contains(".env") && message.contains("缺少")
     ));
+}
+
+#[test]
+fn 多环境文件按最终工作目录解析并依序覆盖且显式变量优先() {
+    let directory = TempDirectory::new();
+    let scripts = directory.path().join("scripts");
+    let working = directory.path().join("数据 工作");
+    std::fs::create_dir_all(&scripts).unwrap();
+    std::fs::create_dir_all(working.join("配置")).unwrap();
+    let script = scripts.join("print.cmd");
+    std::fs::write(&script, "@echo off\r\necho LEGACY_ONLY=%LEGACY_ONLY%\r\necho BASE_ONLY=%BASE_ONLY%\r\necho LAST_ONLY=%LAST_ONLY%\r\necho ORDER=%ORDER%\r\necho PRIORITY=%PRIORITY%\r\necho MIXED_NAME=%MIXED_NAME%\r\necho CASEKEY=%CASEKEY%\r\necho EMPTY=[%EMPTY%]\r\necho COMSPEC=%COMSPEC%\r\n").unwrap();
+    std::fs::write(
+        working.join("legacy.env"),
+        "LEGACY_ONLY=legacy\nORDER=legacy\nPRIORITY=legacy\nMIXED_NAME=legacy\nCaseKey=legacy\n",
+    )
+    .unwrap();
+    std::fs::write(
+        working.join("配置/base.env"),
+        "BASE_ONLY=base\nORDER=base\nPRIORITY=base\nmixed_name=base\nCaseKey=base\nEMPTY=base\n",
+    )
+    .unwrap();
+    let last_file = directory.path().join("额外 配置.env");
+    std::fs::write(
+        &last_file,
+        "LAST_ONLY=last\nORDER=last\nPRIORITY=last\nMIXED_NAME=last\nCASEKEY=last\nEMPTY=\n",
+    )
+    .unwrap();
+    let last_file = last_file.to_string_lossy().into_owned();
+    for (files, expected_order, expected_empty) in [
+        (vec!["配置/base.env".into(), last_file.clone()], "last", ""),
+        (
+            vec![last_file.clone(), "配置/base.env".into()],
+            "base",
+            "base",
+        ),
+        (
+            vec!["配置/base.env".into(), last_file, "配置/base.env".into()],
+            "base",
+            "base",
+        ),
+    ] {
+        let result = run(
+            &ScriptSpec {
+                kind: ScriptKind::Cmd,
+                source: ScriptSource::File(script.to_string_lossy().into_owned()),
+                args: vec![],
+                working_dir: Some("../数据 工作".into()),
+                env: [
+                    ("PRIORITY".into(), "explicit".into()),
+                    ("casekey".into(), "explicit-case".into()),
+                ]
+                .into_iter()
+                .collect(),
+                env_file: Some("legacy.env".into()),
+                env_files: files,
+            },
+            RunOptions {
+                timeout: Some(Duration::from_secs(10)),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(result.returncode, 0, "{}", result.output);
+        for expected in [
+            "LEGACY_ONLY=legacy".to_owned(),
+            "BASE_ONLY=base".into(),
+            "LAST_ONLY=last".into(),
+            "PRIORITY=explicit".into(),
+            "CASEKEY=explicit-case".into(),
+            format!("ORDER={expected_order}"),
+            format!("MIXED_NAME={expected_order}"),
+            format!("EMPTY=[{expected_empty}]"),
+            format!("COMSPEC={}", std::env::var("COMSPEC").unwrap()),
+        ] {
+            assert!(
+                result.output.lines().any(|line| line == expected),
+                "缺少 {expected}: {}",
+                result.output
+            );
+        }
+    }
+}
+
+#[test]
+fn 任一环境文件缺失或格式无效时均不启动脚本() {
+    let directory = TempDirectory::new();
+    std::fs::write(directory.path().join("good.env"), "VALID=1\n").unwrap();
+    std::fs::write(directory.path().join("invalid.env"), "BROKEN_LINE\n").unwrap();
+    for (files, expected) in [
+        (vec!["missing.env", "good.env"], "missing.env"),
+        (vec!["good.env", "missing.env"], "missing.env"),
+        (vec!["invalid.env", "good.env"], "invalid.env"),
+        (vec!["good.env", "invalid.env"], "invalid.env"),
+    ] {
+        let error = run(
+            &ScriptSpec {
+                kind: ScriptKind::Cmd,
+                source: ScriptSource::Inline("@echo started>started.marker\r\n".into()),
+                args: vec![],
+                working_dir: Some(directory.path().to_string_lossy().into_owned()),
+                env: Default::default(),
+                env_file: None,
+                env_files: files.into_iter().map(str::to_owned).collect(),
+            },
+            RunOptions {
+                timeout: Some(Duration::from_secs(5)),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(error, RunnerError::Resolve(message) if message.contains(expected)));
+        assert!(!directory.path().join("started.marker").exists());
+    }
 }
 
 #[test]
@@ -155,6 +269,7 @@ fn cmd_and_manual_commands_preserve_literal_arguments() {
                 working_dir: Some(directory.path().to_string_lossy().into_owned()),
                 env: environment,
                 env_file: None,
+                env_files: Vec::new(),
             },
             RunOptions {
                 timeout: Some(Duration::from_secs(10)),
@@ -200,7 +315,7 @@ fn 大输出保持逐段回调且捕获内存有界() {
     let result = run(&ScriptSpec {
         kind: ScriptKind::Pwsh,
         source: ScriptSource::Inline("[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false); [Console]::Out.Write(('字' * 700000))".into()),
-        args: vec![], working_dir: None, env: Default::default(), env_file: None,
+        args: vec![], working_dir: None, env: Default::default(), env_file: None, env_files: Vec::new(),
     }, RunOptions {
         capture: OutputCapture::Tail(8192), charset: Charset::Utf8,
         timeout: Some(Duration::from_secs(15)),
@@ -234,6 +349,7 @@ fn 输出管道积压时取消仍能结束读取线程() {
             working_dir: None,
             env: Default::default(),
             env_file: None,
+            env_files: Vec::new(),
         },
         RunOptions {
             cancel: Some(cancel),

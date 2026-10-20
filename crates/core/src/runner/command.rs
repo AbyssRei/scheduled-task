@@ -131,6 +131,7 @@ impl Drop for ResolvedCommand {
 
 /// 根据 ScriptKind 构建对应解释器的启动命令。
 pub(super) fn resolve(spec: &ScriptSpec) -> Result<ResolvedCommand, RunnerError> {
+    spec.validate_env_files().map_err(RunnerError::Resolve)?;
     let path = materialize(spec)?;
     let working_dir = path
         .parent()
@@ -236,6 +237,7 @@ pub(super) fn resolve(spec: &ScriptSpec) -> Result<ResolvedCommand, RunnerError>
                     working_dir: None,
                     env: BTreeMap::new(),
                     env_file: None,
+                    env_files: Vec::new(),
                 })?;
                 cmd.program = wrapper.to_string_lossy().into_owned();
                 cmd.temp_files.push(wrapper);
@@ -276,25 +278,26 @@ pub(super) fn resolve(spec: &ScriptSpec) -> Result<ResolvedCommand, RunnerError>
         cmd.working_dir = Some(normalize_separators(path));
     }
 
-    if let Some(value) = spec
-        .env_file
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-    {
+    for value in spec.env_file_paths() {
         let path = PathBuf::from(value.trim());
         let path = if path.is_absolute() {
             path
         } else {
             cmd.working_dir
                 .clone()
-                .or(script_dir)
+                .or_else(|| script_dir.clone())
                 .unwrap_or_else(|| PathBuf::from("."))
                 .join(path)
         };
         let text = std::fs::read_to_string(&path).map_err(|error| {
             RunnerError::Resolve(format!("读取 .env 文件失败 {}: {error}", path.display()))
         })?;
-        cmd.environment = parse_env_file(&text)?;
+        let environment = parse_env_file(&text).map_err(|error| {
+            RunnerError::Resolve(format!("解析 .env 文件失败 {}: {error}", path.display()))
+        })?;
+        for (key, value) in environment {
+            insert_environment(&mut cmd.environment, key, value);
+        }
     }
     for (key, value) in &spec.env {
         let key = key.trim();
@@ -442,6 +445,7 @@ mod tests {
             working_dir: None,
             env: Default::default(),
             env_file: None,
+            env_files: Vec::new(),
         })
         .unwrap();
         let second = resolve(&ScriptSpec {
@@ -451,6 +455,7 @@ mod tests {
             working_dir: None,
             env: Default::default(),
             env_file: None,
+            env_files: Vec::new(),
         })
         .unwrap();
         let first_path = first.temp_files[0].clone();

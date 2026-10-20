@@ -113,18 +113,33 @@ impl Render for TaskDialogView {
                 Textarea::new(&self.env).h(px(84.)).flex_1(),
             ))
             .child(field(
-                ".env 文件",
+                ".env 文件列表",
                 h_flex()
                     .flex_1()
                     .gap_2()
-                    .child(Input::new(&self.env_file).h(px(32.)).flex_1())
                     .child(
-                        Button::new("btn-browse-env-file")
-                            .label("浏览...")
+                        v_flex()
+                            .flex_1()
+                            .gap_1()
+                            .child(
+                                Textarea::new(&self.env_files)
+                                    .h(px(84.))
+                                    .w_full()
+                                    .flex_shrink_0(),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(12.))
+                                    .child("每行一个路径，按从上到下依次覆盖"),
+                            ),
+                    )
+                    .child(
+                        Button::new("btn-browse-env-files")
+                            .label("追加文件...")
                             .on_click({
                                 let view = view.clone();
                                 move |_: &ClickEvent, _, cx| {
-                                    view.update(cx, |this, cx| this.browse_env_file(cx))
+                                    view.update(cx, |this, cx| this.browse_env_files(cx))
                                 }
                             }),
                     ),

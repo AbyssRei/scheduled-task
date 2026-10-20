@@ -25,6 +25,7 @@ fn temp_script(name: &str, content: &str) -> ScriptSpec {
         working_dir: None,
         env: Default::default(),
         env_file: None,
+        env_files: Vec::new(),
     }
 }
 
@@ -301,6 +302,7 @@ fn scenario_reconcile_resets_stuck_running_after_debounce() {
         working_dir: None,
         env: Default::default(),
         env_file: None,
+        env_files: Vec::new(),
     };
     let task = base_task(202, "卡死重置", script.clone());
     let (tx, _rx) = spawn_channel();
@@ -354,6 +356,7 @@ fn scenario_stop_when_executor_gone_finalizes() {
         working_dir: None,
         env: Default::default(),
         env_file: None,
+        env_files: Vec::new(),
     };
     let task = base_task(204, "停止兜底", script.clone());
     let (tx, _rx) = spawn_channel();
@@ -393,6 +396,7 @@ fn scenario_python_uv_launcher_resolves() {
         working_dir: None,
         env: Default::default(),
         env_file: None,
+        env_files: Vec::new(),
     };
     let task = base_task(106, "uv拉起", script);
     let states = TaskStateManager::new();

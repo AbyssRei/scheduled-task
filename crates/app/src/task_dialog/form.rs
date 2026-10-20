@@ -81,7 +81,7 @@ pub(super) struct FormValues {
     pub args: String,
     pub working_dir: String,
     pub env: String,
-    pub env_file: String,
+    pub env_files: String,
     pub schedule_ix: usize,
     pub times: String,
     pub day: String,
@@ -129,7 +129,7 @@ impl FormValues {
             args: task.script.args.join("\n"),
             working_dir: task.script.working_dir.clone().unwrap_or_default(),
             env: environment_text(&task.script.env),
-            env_file: task.script.env_file.clone().unwrap_or_default(),
+            env_files: env_files_text(&task.script),
             schedule_ix: match task.schedule {
                 Schedule::Daily { .. } => 0,
                 Schedule::Monthly { .. } => 1,
@@ -224,7 +224,21 @@ impl FormValues {
         } else {
             parse_env_text(&self.env)?
         };
-        let env_file = preserved_path(&self.env_file, original.map(|task| &task.script.env_file));
+        let (env_file, env_files) = if let Some(task) =
+            original.filter(|task| self.env_files == env_files_text(&task.script))
+        {
+            (task.script.env_file.clone(), task.script.env_files.clone())
+        } else {
+            (
+                None,
+                self.env_files
+                    .lines()
+                    .map(str::trim)
+                    .filter(|path| !path.is_empty())
+                    .map(ToOwned::to_owned)
+                    .collect(),
+            )
+        };
 
         let times_text = self.times;
         let mut times = Vec::new();
@@ -332,6 +346,7 @@ impl FormValues {
                 working_dir,
                 env,
                 env_file,
+                env_files,
             },
             schedule,
             retry,
@@ -350,6 +365,21 @@ pub(super) fn environment_text(environment: &BTreeMap<String, String>) -> String
         .map(|(key, value)| format!("{key}={value}"))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+pub(super) fn env_files_text(script: &ScriptSpec) -> String {
+    script.env_file_paths().collect::<Vec<_>>().join("\n")
+}
+
+pub(super) fn append_env_files(current: &str, paths: &[std::path::PathBuf]) -> String {
+    let mut text = current.to_owned();
+    for path in paths {
+        if !text.is_empty() && !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str(&path.to_string_lossy());
+    }
+    text
 }
 
 fn optional_path(value: &str) -> Option<String> {
@@ -408,7 +438,7 @@ mod tests {
             args: String::new(),
             working_dir: String::new(),
             env: String::new(),
-            env_file: String::new(),
+            env_files: String::new(),
             schedule_ix: 0,
             times: "12:30:00,08:00:00;12:30:00".into(),
             day: String::new(),
@@ -428,7 +458,7 @@ mod tests {
         form.args = " --source\ninput file.txt \n".into();
         form.working_dir = " E:/work ".into();
         form.env = " MODE=fast\nCOUNT=2 ".into();
-        form.env_file = " .env ".into();
+        form.env_files = " .env ".into();
         let task = form.into_config(TaskId(42), None).unwrap();
         assert_eq!(task.id, TaskId(42));
         assert_eq!(task.name, "定时备份");
@@ -443,7 +473,8 @@ mod tests {
         assert_eq!(task.script.args, vec!["--source", "input file.txt"]);
         assert_eq!(task.script.working_dir.as_deref(), Some("E:/work"));
         assert_eq!(task.script.env.get("MODE"), Some(&"fast".to_string()));
-        assert_eq!(task.script.env_file.as_deref(), Some(".env"));
+        assert!(task.script.env_file.is_none());
+        assert_eq!(task.script.env_files, vec![".env"]);
     }
 
     #[test]
@@ -497,6 +528,51 @@ mod tests {
             format!("{:?}", original.script)
         );
         assert_eq!(saved.retry.unwrap().cooldown.as_secs(), 37);
+    }
+
+    #[test]
+    fn 多环境文件表单保留旧字段与加载顺序并支持修改清空和多选追加() {
+        let mut original = valid_form().into_config(TaskId(42), None).unwrap();
+        original.script.env_file = Some("legacy.env".into());
+        original.script.env_files = vec!["配置/base.env".into(), "额外 配置.env".into()];
+        let values = FormValues::from_config(&original);
+        assert_eq!(values.env_files, "legacy.env\n配置/base.env\n额外 配置.env");
+        let saved = values.into_config(original.id, Some(&original)).unwrap();
+        assert_eq!(
+            format!("{:?}", saved.script),
+            format!("{:?}", original.script)
+        );
+        let mut values = FormValues::from_config(&original);
+        values.name = "仅改名".into();
+        let saved = values.into_config(original.id, Some(&original)).unwrap();
+        assert_eq!(saved.script.env_file, original.script.env_file);
+        assert_eq!(saved.script.env_files, original.script.env_files);
+        let mut values = FormValues::from_config(&original);
+        values.env_files = " base.env \n\n config/local.env\nbase.env\n".into();
+        let saved = values.into_config(original.id, Some(&original)).unwrap();
+        assert!(saved.script.env_file.is_none());
+        assert_eq!(
+            saved.script.env_files,
+            vec!["base.env", "config/local.env", "base.env"]
+        );
+        let mut values = FormValues::from_config(&original);
+        values.env_files.clear();
+        let saved = values.into_config(original.id, Some(&original)).unwrap();
+        assert!(saved.script.env_file.is_none() && saved.script.env_files.is_empty());
+        let paths = [
+            std::path::PathBuf::from("first.env"),
+            std::path::PathBuf::from("配置 空格.env"),
+        ];
+        assert_eq!(
+            append_env_files("legacy.env", &paths),
+            "legacy.env\nfirst.env\n配置 空格.env"
+        );
+        assert_eq!(
+            append_env_files("legacy.env\n", &paths),
+            "legacy.env\nfirst.env\n配置 空格.env"
+        );
+        assert_eq!(append_env_files("", &paths), "first.env\n配置 空格.env");
+        assert_eq!(append_env_files("draft.env", &[]), "draft.env");
     }
 
     #[test]

@@ -22,8 +22,8 @@ use scheduled_task_core::model::{Schedule, ScriptKind, ScriptSource, TaskConfig,
 use crate::bridge::AppCore;
 use crate::widgets::{PickDelegate, PickItem};
 use form::{
-    CONCURRENCY_OPTIONS, FormValues, KIND_OPTIONS, SCHEDULE_OPTIONS, concurrency_fields,
-    ix_from_kind,
+    CONCURRENCY_OPTIONS, FormValues, KIND_OPTIONS, SCHEDULE_OPTIONS, append_env_files,
+    concurrency_fields, ix_from_kind,
 };
 
 /// 表单视图(对话框内容)。
@@ -44,7 +44,7 @@ pub struct TaskDialogView {
     args: Entity<TextareaState>,
     working_dir: Entity<InputState>,
     env: Entity<TextareaState>,
-    env_file: Entity<InputState>,
+    env_files: Entity<TextareaState>,
     schedule_state: Entity<ComboboxState<PickDelegate>>,
     schedule_ix: usize,
     times: Entity<InputState>,
@@ -177,7 +177,11 @@ impl TaskDialogView {
         let args = Self::new_textarea(window, cx, "每行一个参数,空行忽略");
         let working_dir = Self::new_input(window, cx, "留空则使用脚本所在目录");
         let env = Self::new_textarea(window, cx, "每行一个 KEY=VALUE,空行和 # 注释忽略");
-        let env_file = Self::new_input(window, cx, ".env 文件路径(可选)");
+        let env_files = Self::new_textarea(
+            window,
+            cx,
+            "每行一个 .env 路径，后面的文件覆盖前面的同名变量",
+        );
         let times = Self::new_input(window, cx, "多个时间用逗号分隔,如 08:00:00,12:30:00");
         let day = Self::new_input(window, cx, "1–31");
         let pattern = Self::new_textarea(window, cx, "每行一个候选模式;留空=核心内容一致");
@@ -219,9 +223,7 @@ impl TaskDialogView {
                     .join("\n");
                 env.update(cx, |st, cx| st.set_value(text, window, cx));
             }
-            if let Some(value) = &t.script.env_file {
-                env_file.update(cx, |st, cx| st.set_value(value.clone(), window, cx));
-            }
+            env_files.update(cx, |st, cx| st.set_value(values.env_files, window, cx));
             times.update(cx, |st, cx| {
                 let joined = t
                     .schedule
@@ -303,7 +305,7 @@ impl TaskDialogView {
             args,
             working_dir,
             env,
-            env_file,
+            env_files,
             schedule_state,
             schedule_ix,
             times,
@@ -360,7 +362,7 @@ impl TaskDialogView {
             args: self.args.read(cx).value().to_string(),
             working_dir: self.working_dir.read(cx).value().to_string(),
             env: self.env.read(cx).value().to_string(),
-            env_file: self.env_file.read(cx).value().to_string(),
+            env_files: self.env_files.read(cx).value().to_string(),
             schedule_ix: self.schedule_ix,
             times: self.times.read(cx).value().to_string(),
             day: self.day.read(cx).value().to_string(),
@@ -422,22 +424,22 @@ impl TaskDialogView {
         .detach();
     }
 
-    fn browse_env_file(&mut self, cx: &mut App) {
+    fn browse_env_files(&mut self, cx: &mut App) {
         let rx = cx.prompt_for_paths(PathPromptOptions {
             files: true,
             directories: false,
-            multiple: false,
-            prompt: Some("选择 .env 文件".into()),
+            multiple: true,
+            prompt: Some("选择要追加的 .env 文件（可多选）".into()),
         });
-        let path_input = self.env_file.clone();
+        let path_input = self.env_files.clone();
         let handle = self.handle;
         cx.spawn(async move |cx| {
-            if let Ok(Ok(Some(paths))) = rx.await
-                && let Some(p) = paths.first()
-            {
-                let text = p.to_string_lossy().into_owned();
+            if let Ok(Ok(Some(paths))) = rx.await {
                 let _ = handle.update(cx, |_, window, cx| {
-                    path_input.update(cx, |st, cx| st.set_value(text, window, cx));
+                    path_input.update(cx, |st, cx| {
+                        let text = append_env_files(&st.value(), &paths);
+                        st.set_value(text, window, cx);
+                    });
                 });
             }
         })
