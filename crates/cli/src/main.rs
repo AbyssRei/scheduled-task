@@ -13,14 +13,17 @@ use scheduled_task_core::store::TaskStore;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    match args.first().map(String::as_str) {
-        Some("run") if args.len() >= 2 => run(&args[1], args.get(3).map(String::as_str)),
+    let code = match args.as_slice() {
+        [command, path] if command == "run" => run(path, None),
+        [command, path, flag, key] if command == "run" && flag == "--task" && !key.is_empty() => {
+            run(path, Some(key))
+        }
         _ => {
             eprintln!("用法: scheduled-task-cli run <config.ron> [--task <id|名称>]");
             exit_with_logs(2);
         }
-    }
-    scheduled_task_core::logger::shutdown_logging();
+    };
+    exit_with_logs(code);
 }
 
 fn exit_with_logs(code: i32) -> ! {
@@ -28,7 +31,7 @@ fn exit_with_logs(code: i32) -> ! {
     std::process::exit(code)
 }
 
-fn run(config_path: &str, only_task: Option<&str>) {
+fn run(config_path: &str, only_task: Option<&str>) -> i32 {
     let store = TaskStore::new(config_path.into());
     let config = match store.load() {
         Ok(c) => c,
@@ -72,19 +75,33 @@ fn run(config_path: &str, only_task: Option<&str>) {
                 daemon.execute_now(t.id);
                 // 阻塞等待该任务执行结束
                 while let Ok(event) = rx.recv() {
-                    let done = matches!(&event, DaemonEvent::Finished { id, .. } | DaemonEvent::AdmittedRejected { id, .. } if *id == t.id);
+                    let exit = match &event {
+                        DaemonEvent::Finished {
+                            id,
+                            returncode,
+                            retry_triggered,
+                        } if *id == t.id => Some(if *returncode == 0 && !retry_triggered {
+                            0
+                        } else {
+                            1
+                        }),
+                        DaemonEvent::AdmittedRejected { id, .. } if *id == t.id => Some(3),
+                        _ => None,
+                    };
                     print_event(event);
-                    if done {
-                        break;
+                    if let Some(code) = exit {
+                        daemon.shutdown();
+                        return code;
                     }
                 }
             }
             None => {
                 eprintln!("未找到任务: {key}");
-                exit_with_logs(1);
+                exit_with_logs(3);
             }
         }
-        return;
+        eprintln!("任务事件通道意外关闭");
+        return 1;
     }
 
     // 调度模式
