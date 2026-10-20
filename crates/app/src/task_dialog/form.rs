@@ -68,6 +68,10 @@ pub(super) fn ix_from_kind(kind: &ScriptKind) -> usize {
 
 /// 保存时读取的表单快照,将控件访问与配置校验分离。
 pub(super) struct FormValues {
+    pub source_inline: bool,
+    pub inline_content: String,
+    pub uv_project: String,
+    pub cooldown: String,
     pub concurrency_ix: usize,
     pub concurrency_group: String,
     pub name: String,
@@ -91,28 +95,136 @@ pub(super) struct FormValues {
 }
 
 impl FormValues {
-    pub(super) fn into_config(self, id: TaskId) -> Result<TaskConfig, String> {
+    pub(super) fn from_config(task: &TaskConfig) -> Self {
+        let (concurrency_ix, concurrency_group) = concurrency_fields(&task.concurrency);
+        Self {
+            source_inline: matches!(task.script.source, ScriptSource::Inline(_)),
+            inline_content: match &task.script.source {
+                ScriptSource::Inline(content) => content.clone(),
+                _ => String::new(),
+            },
+            uv_project: match &task.script.kind {
+                ScriptKind::Python {
+                    launcher: PyLauncher::Uv { project },
+                } => project.clone().unwrap_or_default(),
+                _ => String::new(),
+            },
+            cooldown: task
+                .retry
+                .as_ref()
+                .map(|retry| retry.cooldown.as_secs().to_string())
+                .unwrap_or_default(),
+            concurrency_ix,
+            concurrency_group,
+            name: task.name.clone(),
+            path: match &task.script.source {
+                ScriptSource::File(path) => path.clone(),
+                _ => String::new(),
+            },
+            kind_ix: ix_from_kind(&task.script.kind),
+            manual_cmd: match &task.script.kind {
+                ScriptKind::Manual { command } => command.clone(),
+                _ => String::new(),
+            },
+            args: task.script.args.join("\n"),
+            working_dir: task.script.working_dir.clone().unwrap_or_default(),
+            env: environment_text(&task.script.env),
+            env_file: task.script.env_file.clone().unwrap_or_default(),
+            schedule_ix: match task.schedule {
+                Schedule::Daily { .. } => 0,
+                Schedule::Monthly { .. } => 1,
+                Schedule::Custom { .. } => 2,
+            },
+            times: task
+                .schedule
+                .times()
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(","),
+            day: task
+                .schedule
+                .monthly_day()
+                .map(|day| day.get().to_string())
+                .unwrap_or_default(),
+            retry_on: task.retry.is_some(),
+            pattern: task
+                .retry
+                .as_ref()
+                .map(|retry| retry.pattern.clone())
+                .unwrap_or_default(),
+            window_n: task
+                .retry
+                .as_ref()
+                .map(|retry| retry.window.to_string())
+                .unwrap_or_default(),
+            max_retries: task
+                .retry
+                .as_ref()
+                .map(|retry| retry.max_retries.to_string())
+                .unwrap_or_default(),
+            timeout_on: task.timeout.is_some(),
+            timeout_min: task
+                .timeout
+                .map(|timeout| (timeout.as_secs() / 60).to_string())
+                .unwrap_or_default(),
+            enabled: task.enabled,
+        }
+    }
+    pub(super) fn into_config(
+        self,
+        id: TaskId,
+        original: Option<&TaskConfig>,
+    ) -> Result<TaskConfig, String> {
         let name = self.name;
         if name.trim().is_empty() {
             return Err("任务名称不能为空".into());
         }
         let path = self.path;
-        if path.trim().is_empty() {
+        if !self.source_inline && path.trim().is_empty() {
             return Err("脚本路径不能为空".into());
         }
         let manual_cmd = self.manual_cmd;
-        let kind = kind_from_ix(self.kind_ix, &manual_cmd);
+        let mut kind = kind_from_ix(self.kind_ix, &manual_cmd);
+        if let ScriptKind::Python {
+            launcher: PyLauncher::Uv { project },
+        } = &mut kind
+        {
+            *project = original
+                .and_then(|task| match &task.script.kind {
+                    ScriptKind::Python {
+                        launcher: PyLauncher::Uv { project },
+                    } if self.uv_project == project.as_deref().unwrap_or_default() => {
+                        Some(project.clone())
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| optional_path(&self.uv_project));
+        }
 
-        let args = self
-            .args
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty())
-            .map(ToOwned::to_owned)
-            .collect();
-        let working_dir = optional_path(&self.working_dir);
-        let env = parse_env_text(&self.env)?;
-        let env_file = optional_path(&self.env_file);
+        let args =
+            if let Some(task) = original.filter(|task| self.args == task.script.args.join("\n")) {
+                task.script.args.clone()
+            } else {
+                self.args
+                    .lines()
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty())
+                    .map(ToOwned::to_owned)
+                    .collect()
+            };
+        let working_dir = preserved_path(
+            &self.working_dir,
+            original.map(|task| &task.script.working_dir),
+        );
+        let env = if let Some(task) =
+            original.filter(|task| self.env == environment_text(&task.script.env))
+        {
+            task.script.env.clone()
+        } else {
+            parse_env_text(&self.env)?
+        };
+        let env_file = preserved_path(&self.env_file, original.map(|task| &task.script.env_file));
 
         let times_text = self.times;
         let mut times = Vec::new();
@@ -164,7 +276,14 @@ impl FormValues {
                 pattern,
                 window: parse_range(&window_text, 1, 100, 5, "连续次数")?,
                 max_retries: parse_range(&max_text, 1, 10, 3, "最大重试次数")?,
-                cooldown: std::time::Duration::from_secs(2),
+                cooldown: std::time::Duration::from_secs(if self.cooldown.trim().is_empty() {
+                    2
+                } else {
+                    self.cooldown
+                        .trim()
+                        .parse()
+                        .map_err(|_| "重试冷却应为非负整数秒".to_string())?
+                }),
             })
         } else {
             None
@@ -189,17 +308,26 @@ impl FormValues {
                 if group.is_empty() {
                     return Err("同组互斥需要填写组名".into());
                 }
-                ConcurrencyPolicy::Group(group.to_string())
+                original.filter(|task| matches!(&task.concurrency, ConcurrencyPolicy::Group(original) if original == &self.concurrency_group))
+                    .map(|task| task.concurrency.clone()).unwrap_or_else(|| ConcurrencyPolicy::Group(group.to_string()))
             }
             _ => return Err("请选择有效的并发策略".into()),
         };
 
         let task = TaskConfig {
             id,
-            name: name.trim().to_string(),
+            name: original
+                .filter(|task| task.name == name)
+                .map(|task| task.name.clone())
+                .unwrap_or_else(|| name.trim().to_string()),
             script: ScriptSpec {
                 kind,
-                source: ScriptSource::File(path.trim().to_string()),
+                source: if self.source_inline {
+                    ScriptSource::Inline(self.inline_content)
+                } else {
+                    original.filter(|task| matches!(&task.script.source, ScriptSource::File(original) if original == &path))
+                        .map(|task| task.script.source.clone()).unwrap_or_else(|| ScriptSource::File(path.trim().to_string()))
+                },
                 args,
                 working_dir,
                 env,
@@ -216,9 +344,24 @@ impl FormValues {
     }
 }
 
+pub(super) fn environment_text(environment: &BTreeMap<String, String>) -> String {
+    environment
+        .iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn optional_path(value: &str) -> Option<String> {
     let value = value.trim();
     (!value.is_empty()).then(|| value.to_string())
+}
+
+fn preserved_path(value: &str, original: Option<&Option<String>>) -> Option<String> {
+    original
+        .filter(|original| original.as_deref().unwrap_or_default() == value)
+        .cloned()
+        .unwrap_or_else(|| optional_path(value))
 }
 
 /// 解析表单中的环境变量文本。每行一个 `KEY=VALUE`,空行和 `#` 注释忽略。
@@ -252,6 +395,10 @@ mod tests {
 
     fn valid_form() -> FormValues {
         FormValues {
+            source_inline: false,
+            inline_content: String::new(),
+            uv_project: String::new(),
+            cooldown: String::new(),
             concurrency_ix: 0,
             concurrency_group: String::new(),
             name: "  定时备份  ".into(),
@@ -282,7 +429,7 @@ mod tests {
         form.working_dir = " E:/work ".into();
         form.env = " MODE=fast\nCOUNT=2 ".into();
         form.env_file = " .env ".into();
-        let task = form.into_config(TaskId(42)).unwrap();
+        let task = form.into_config(TaskId(42), None).unwrap();
         assert_eq!(task.id, TaskId(42));
         assert_eq!(task.name, "定时备份");
         assert!(matches!(
@@ -310,8 +457,69 @@ mod tests {
             let mut form = valid_form();
             form.concurrency_ix = ix;
             form.concurrency_group = group;
-            assert_eq!(form.into_config(TaskId(42)).unwrap().concurrency, policy);
+            assert_eq!(
+                form.into_config(TaskId(42), None).unwrap().concurrency,
+                policy
+            );
         }
+    }
+
+    #[test]
+    fn 原样保存内联任务保留项目冷却和不可无损展示的参数环境() {
+        let mut original = valid_form().into_config(TaskId(42), None).unwrap();
+        original.script.kind = ScriptKind::Python {
+            launcher: PyLauncher::Uv {
+                project: Some(" 项目目录 ".into()),
+            },
+        };
+        original.script.source = ScriptSource::Inline("print('内联脚本')\r\n".into());
+        original.script.args = vec!["".into(), " 前后空格 ".into(), "多\n行".into()];
+        original
+            .script
+            .env
+            .insert("VALUE".into(), " 原始值\n ".into());
+        original.script.working_dir = Some(" 工作目录 ".into());
+        original.script.env_file = Some("".into());
+        original.retry = Some(RetryPolicy {
+            cooldown: std::time::Duration::from_secs(37),
+            ..Default::default()
+        });
+        original.concurrency = ConcurrencyPolicy::Group(" 原组名 ".into());
+        let values = FormValues::from_config(&original);
+        let saved = values.into_config(original.id, Some(&original)).unwrap();
+        assert_eq!(format!("{saved:?}"), format!("{original:?}"));
+        let mut values = FormValues::from_config(&original);
+        values.name = "仅修改名称".into();
+        let saved = values.into_config(original.id, Some(&original)).unwrap();
+        assert_eq!(saved.name, "仅修改名称");
+        assert_eq!(
+            format!("{:?}", saved.script),
+            format!("{:?}", original.script)
+        );
+        assert_eq!(saved.retry.unwrap().cooldown.as_secs(), 37);
+    }
+
+    #[test]
+    fn 可以修改脚本来源项目和冷却且关闭重试忽略无效冷却() {
+        let original = valid_form().into_config(TaskId(42), None).unwrap();
+        let mut values = FormValues::from_config(&original);
+        values.source_inline = true;
+        values.inline_content = "print('修改')".into();
+        values.kind_ix = 5;
+        values.uv_project = " E:/project ".into();
+        values.retry_on = true;
+        values.cooldown = "19".into();
+        let saved = values.into_config(original.id, Some(&original)).unwrap();
+        assert!(
+            matches!(saved.script.source, ScriptSource::Inline(ref text) if text == "print('修改')")
+        );
+        assert!(
+            matches!(saved.script.kind, ScriptKind::Python { launcher: PyLauncher::Uv { project: Some(ref project) } } if project == "E:/project")
+        );
+        assert_eq!(saved.retry.unwrap().cooldown.as_secs(), 19);
+        let mut values = FormValues::from_config(&original);
+        values.cooldown = "无效".into();
+        assert!(values.into_config(original.id, Some(&original)).is_ok());
     }
 
     #[test]
@@ -320,14 +528,14 @@ mod tests {
         form.concurrency_ix = 2;
         form.concurrency_group = "   ".into();
         assert_eq!(
-            form.into_config(TaskId(0)).unwrap_err(),
+            form.into_config(TaskId(0), None).unwrap_err(),
             "同组互斥需要填写组名"
         );
         let mut form = valid_form();
         form.concurrency_ix = 2;
         form.concurrency_group = "  备份组  ".into();
         assert_eq!(
-            form.into_config(TaskId(0)).unwrap().concurrency,
+            form.into_config(TaskId(0), None).unwrap().concurrency,
             ConcurrencyPolicy::Group("备份组".into())
         );
     }
@@ -343,7 +551,7 @@ mod tests {
         form.pattern = "模式一\n模式二".into();
         form.timeout_on = true;
         form.timeout_min = "300".into();
-        let task = form.into_config(TaskId(0)).unwrap();
+        let task = form.into_config(TaskId(0), None).unwrap();
         assert!(
             matches!(task.script.kind, ScriptKind::Manual { command } if command == "custom {script}")
         );
@@ -363,7 +571,7 @@ mod tests {
         form.window_n = "不是数字".into();
         form.max_retries = "不是数字".into();
         form.timeout_min = "不是数字".into();
-        let task = form.into_config(TaskId(0)).unwrap();
+        let task = form.into_config(TaskId(0), None).unwrap();
         assert!(matches!(task.schedule, Schedule::Daily { .. }));
         assert!(task.retry.is_none());
         assert!(task.timeout.is_none());
@@ -376,7 +584,7 @@ mod tests {
             form.retry_on = true;
             form.window_n = value.into();
             assert_eq!(
-                form.into_config(TaskId(0)).unwrap_err(),
+                form.into_config(TaskId(0), None).unwrap_err(),
                 "连续次数 应在 1–100 之间"
             );
         }
@@ -385,7 +593,7 @@ mod tests {
             form.retry_on = true;
             form.max_retries = value.into();
             assert_eq!(
-                form.into_config(TaskId(0)).unwrap_err(),
+                form.into_config(TaskId(0), None).unwrap_err(),
                 "最大重试次数 应在 1–10 之间"
             );
         }
@@ -394,7 +602,7 @@ mod tests {
             form.timeout_on = true;
             form.timeout_min = value.into();
             assert_eq!(
-                form.into_config(TaskId(0)).unwrap_err(),
+                form.into_config(TaskId(0), None).unwrap_err(),
                 "超时应为 1–300 分钟"
             );
         }

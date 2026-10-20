@@ -34,6 +34,10 @@ pub struct TaskDialogView {
 
     name: Entity<InputState>,
     path: Entity<InputState>,
+    source_inline: bool,
+    inline_content: Entity<TextareaState>,
+    uv_project: Entity<InputState>,
+    cooldown: Entity<InputState>,
     kind_state: Entity<ComboboxState<PickDelegate>>,
     kind_ix: usize,
     manual_cmd: Entity<InputState>,
@@ -164,6 +168,11 @@ impl TaskDialogView {
 
         let name = Self::new_input(window, cx, "任务名称");
         let path = Self::new_input(window, cx, "脚本绝对路径(如 E:\\work\\run.bat)");
+        let inline_content = Self::new_textarea(window, cx, "输入内联脚本内容");
+        let uv_project = Self::new_input(window, cx, "uv 项目目录(可选)");
+        let cooldown = Self::new_input(window, cx, "重试冷却秒数，默认 2");
+        let source_inline =
+            t.is_some_and(|task| matches!(task.script.source, ScriptSource::Inline(_)));
         let manual_cmd = Self::new_input(window, cx, "手工命令,{script} 代表脚本路径");
         let args = Self::new_textarea(window, cx, "每行一个参数,空行忽略");
         let working_dir = Self::new_input(window, cx, "留空则使用脚本所在目录");
@@ -179,6 +188,14 @@ impl TaskDialogView {
         concurrency_group.update(cx, |st, cx| st.set_value(group, window, cx));
 
         if let Some(t) = t {
+            let values = FormValues::from_config(t);
+            inline_content.update(cx, |state, cx| {
+                state.set_value(values.inline_content, window, cx)
+            });
+            uv_project.update(cx, |state, cx| {
+                state.set_value(values.uv_project, window, cx)
+            });
+            cooldown.update(cx, |state, cx| state.set_value(values.cooldown, window, cx));
             name.update(cx, |st, cx| st.set_value(t.name.clone(), window, cx));
             if let ScriptSource::File(p) = &t.script.source {
                 path.update(cx, |st, cx| st.set_value(p.clone(), window, cx));
@@ -276,6 +293,10 @@ impl TaskDialogView {
             handle,
             name,
             path,
+            source_inline,
+            inline_content,
+            uv_project,
+            cooldown,
             kind_state,
             kind_ix,
             manual_cmd,
@@ -326,6 +347,10 @@ impl TaskDialogView {
 
     fn collect_config(&self, cx: &App) -> Result<TaskConfig, String> {
         let values = FormValues {
+            source_inline: self.source_inline,
+            inline_content: self.inline_content.read(cx).value().to_string(),
+            uv_project: self.uv_project.read(cx).value().to_string(),
+            cooldown: self.cooldown.read(cx).value().to_string(),
             concurrency_ix: self.concurrency_ix,
             concurrency_group: self.concurrency_group.read(cx).value().to_string(),
             name: self.name.read(cx).value().to_string(),
@@ -347,7 +372,10 @@ impl TaskDialogView {
             timeout_min: self.timeout_min.read(cx).value().to_string(),
             enabled: self.enabled,
         };
-        values.into_config(self.editing.as_ref().map_or(TaskId(0), |task| task.id))
+        values.into_config(
+            self.editing.as_ref().map_or(TaskId(0), |task| task.id),
+            self.editing.as_ref(),
+        )
     }
 
     fn browse(&mut self, _window: &mut gpui_kit::Window, cx: &mut App) {

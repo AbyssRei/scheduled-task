@@ -1,5 +1,6 @@
 //! 表单控件布局与交互绑定。
 
+use gpui_kit::base::Selectable as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::combobox::Combobox;
@@ -36,18 +37,55 @@ impl Render for TaskDialogView {
             .child(field("任务名称", Input::new(&self.name).h(px(32.))))
             .child(field("脚本类型", Combobox::new(&self.kind_state)))
             .child(field(
-                "脚本路径",
+                "脚本来源",
                 h_flex()
-                    .flex_1()
                     .gap_2()
-                    .child(Input::new(&self.path).h(px(32.)).flex_1())
-                    .child(Button::new("btn-browse").label("浏览...").on_click({
-                        let view = view.clone();
-                        move |_: &ClickEvent, window, cx| {
-                            view.update(cx, |this, cx| this.browse(window, cx))
-                        }
-                    })),
+                    .child(
+                        Button::new("source-file")
+                            .label("文件脚本")
+                            .selected(!self.source_inline)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.source_inline = false;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new("source-inline")
+                            .label("内联脚本")
+                            .selected(self.source_inline)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.source_inline = true;
+                                cx.notify();
+                            })),
+                    ),
             ))
+            .when(self.source_inline, |layout| {
+                layout.child(field(
+                    "脚本内容",
+                    Textarea::new(&self.inline_content).h(px(160.)).flex_1(),
+                ))
+            })
+            .when(!self.source_inline, |layout| {
+                layout.child(field(
+                    "脚本路径",
+                    h_flex()
+                        .flex_1()
+                        .gap_2()
+                        .child(Input::new(&self.path).h(px(32.)).flex_1())
+                        .child(Button::new("btn-browse").label("浏览...").on_click({
+                            let view = view.clone();
+                            move |_: &ClickEvent, window, cx| {
+                                view.update(cx, |this, cx| this.browse(window, cx))
+                            }
+                        })),
+                ))
+            })
+            .when(self.kind_ix == 5, |layout| {
+                layout.child(field(
+                    "uv 项目目录",
+                    Input::new(&self.uv_project).h(px(32.)).flex_1(),
+                ))
+            })
             .child(field("手工命令", Input::new(&self.manual_cmd).h(px(32.))))
             .child(field(
                 "命令行参数",
@@ -167,6 +205,12 @@ impl Render for TaskDialogView {
                     .child(div().w(px(110.)).flex_shrink_0().child("超时(分钟)"))
                     .child(NumberInput::new(&self.timeout_min).w(px(110.))),
             )
+            .when(self.retry_on, |layout| {
+                layout.child(field(
+                    "重试冷却(秒)",
+                    NumberInput::new(&self.cooldown).w(px(110.)),
+                ))
+            })
     }
 }
 
