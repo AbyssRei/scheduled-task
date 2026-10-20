@@ -56,7 +56,7 @@ fn command_options_reach_script_with_expected_precedence() {
             args: vec!["first value".into(), "second".into()],
             working_dir: Some(directory.path().to_string_lossy().into_owned()),
             env,
-            env_file: Some(".env".into()), env_files: Vec::new(),
+            env_file: Some(".env".into()), env_order: Vec::new(), env_files: Vec::new(),
         },
         RunOptions {
             timeout: Some(Duration::from_secs(10)),
@@ -101,6 +101,7 @@ fn invalid_dotenv_blocks_process_start() {
             working_dir: Some(directory.path().to_string_lossy().into_owned()),
             env: BTreeMap::new(),
             env_file: Some("invalid.env".into()),
+            env_order: Vec::new(),
             env_files: Vec::new(),
         },
         RunOptions {
@@ -114,6 +115,51 @@ fn invalid_dotenv_blocks_process_start() {
         error,
         RunnerError::Resolve(message) if message.contains(".env") && message.contains("缺少")
     ));
+}
+
+#[test]
+fn 显式变量按保存顺序覆盖大小写同名变量() {
+    for (order, expected) in [
+        (
+            vec!["scheduled_task_env_order", "SCHEDULED_TASK_ENV_ORDER"],
+            "upper",
+        ),
+        (
+            vec!["SCHEDULED_TASK_ENV_ORDER", "scheduled_task_env_order"],
+            "lower",
+        ),
+    ] {
+        let result = run(
+            &ScriptSpec {
+                kind: ScriptKind::Cmd,
+                source: ScriptSource::Inline(
+                    "@echo off\r\necho ORDER=%SCHEDULED_TASK_ENV_ORDER%\r\n".into(),
+                ),
+                args: Vec::new(),
+                working_dir: None,
+                env: [
+                    ("SCHEDULED_TASK_ENV_ORDER".into(), "upper".into()),
+                    ("scheduled_task_env_order".into(), "lower".into()),
+                ]
+                .into_iter()
+                .collect(),
+                env_order: order.into_iter().map(str::to_owned).collect(),
+                env_file: None,
+                env_files: Vec::new(),
+            },
+            RunOptions {
+                timeout: Some(Duration::from_secs(10)),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(result.returncode, 0, "{}", result.output);
+        assert!(
+            result.output.contains(&format!("ORDER={expected}")),
+            "{}",
+            result.output
+        );
+    }
 }
 
 #[test]
@@ -168,6 +214,7 @@ fn 多环境文件按最终工作目录解析并依序覆盖且显式变量优�
                 .into_iter()
                 .collect(),
                 env_file: Some("legacy.env".into()),
+                env_order: Vec::new(),
                 env_files: files,
             },
             RunOptions {
@@ -216,6 +263,7 @@ fn 任一环境文件缺失或格式无效时均不启动脚本() {
                 working_dir: Some(directory.path().to_string_lossy().into_owned()),
                 env: Default::default(),
                 env_file: None,
+                env_order: Vec::new(),
                 env_files: files.into_iter().map(str::to_owned).collect(),
             },
             RunOptions {
@@ -269,6 +317,7 @@ fn cmd_and_manual_commands_preserve_literal_arguments() {
                 working_dir: Some(directory.path().to_string_lossy().into_owned()),
                 env: environment,
                 env_file: None,
+                env_order: Vec::new(),
                 env_files: Vec::new(),
             },
             RunOptions {
@@ -315,7 +364,7 @@ fn 大输出保持逐段回调且捕获内存有界() {
     let result = run(&ScriptSpec {
         kind: ScriptKind::Pwsh,
         source: ScriptSource::Inline("[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false); [Console]::Out.Write(('字' * 700000))".into()),
-        args: vec![], working_dir: None, env: Default::default(), env_file: None, env_files: Vec::new(),
+        args: vec![], working_dir: None, env: Default::default(), env_file: None, env_order: Vec::new(), env_files: Vec::new(),
     }, RunOptions {
         capture: OutputCapture::Tail(8192), charset: Charset::Utf8,
         timeout: Some(Duration::from_secs(15)),
@@ -349,6 +398,7 @@ fn 输出管道积压时取消仍能结束读取线程() {
             working_dir: None,
             env: Default::default(),
             env_file: None,
+            env_order: Vec::new(),
             env_files: Vec::new(),
         },
         RunOptions {

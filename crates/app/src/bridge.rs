@@ -314,7 +314,7 @@ mod tests {
         ConcurrencyPolicy, Schedule, ScriptKind, ScriptSource, ScriptSpec,
     };
 
-    struct TestCore(AppCore, std::path::PathBuf);
+    struct TestCore(Arc<AppCore>, std::path::PathBuf);
 
     impl TestCore {
         fn new() -> Self {
@@ -339,6 +339,7 @@ mod tests {
                         working_dir: None,
                         env: Default::default(),
                         env_file: None,
+                        env_order: Vec::new(),
                         env_files: Vec::new(),
                     },
                     schedule: Schedule::Daily {
@@ -358,7 +359,7 @@ mod tests {
             };
             core.store.save(&core.config_snapshot()).unwrap();
             core.daemon.load(core.tasks());
-            Self(core, directory)
+            Self(Arc::new(core), directory)
         }
 
         fn changed(&self) -> AppSettings {
@@ -380,6 +381,65 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.1);
         }
+    }
+
+    /// 真实桌面回归入口：仅加载临时配置，不启动调度线程、托盘或保活。
+    #[test]
+    #[ignore = "需要真实桌面交互，关闭验收窗口后结束"]
+    fn 环境条目拖动桌面验收() {
+        use gpui_kit::{AppContext as _, WindowBounds, WindowOptions, px, size};
+
+        let test = TestCore::new();
+        let core = test.0.clone();
+        let mut task = core.tasks()[0].clone();
+        task.script.env_files = vec![
+            ".env".into(),
+            "config/.env.local".into(),
+            "config/中文.env".into(),
+        ];
+        for (key, value) in [
+            ("FIRST", "首条变量"),
+            ("SECOND", "第一行\n第二行\n第三行"),
+            ("THIRD", "  保留空格  "),
+            ("LAST", ""),
+        ] {
+            task.script.env.insert(key.into(), value.into());
+            task.script.env_order.push(key.into());
+        }
+        gpui_kit::application()
+            .with_assets(gpui_kit::assets::Assets)
+            .run(move |cx| {
+                gpui_kit::init(cx);
+                gpui_kit::open_window(
+                    WindowOptions {
+                        titlebar: Some(gpui_kit::TitlebarOptions {
+                            title: Some("环境条目拖动验收（临时配置）".into()),
+                            ..Default::default()
+                        }),
+                        window_bounds: Some(WindowBounds::Windowed(gpui_kit::Bounds::centered(
+                            None,
+                            size(px(1080.), px(800.)),
+                            cx,
+                        ))),
+                        ..Default::default()
+                    },
+                    cx,
+                    |window, cx| {
+                        window.on_window_should_close(cx, |_, cx| {
+                            cx.quit();
+                            true
+                        });
+                        let edit_core = core.clone();
+                        window.on_next_frame(move |window, cx| {
+                            crate::task_dialog::TaskDialogView::open_edit(
+                                edit_core, task, window, cx,
+                            );
+                        });
+                        cx.new(|cx| crate::main_window::TaskListView::new(core.clone(), window, cx))
+                    },
+                )
+                .expect("打开拖动验收窗口失败");
+            });
     }
 
     #[test]

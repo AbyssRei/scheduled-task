@@ -237,6 +237,7 @@ pub(super) fn resolve(spec: &ScriptSpec) -> Result<ResolvedCommand, RunnerError>
                     working_dir: None,
                     env: BTreeMap::new(),
                     env_file: None,
+                    env_order: Vec::new(),
                     env_files: Vec::new(),
                 })?;
                 cmd.program = wrapper.to_string_lossy().into_owned();
@@ -299,7 +300,7 @@ pub(super) fn resolve(spec: &ScriptSpec) -> Result<ResolvedCommand, RunnerError>
             insert_environment(&mut cmd.environment, key, value);
         }
     }
-    for (key, value) in &spec.env {
+    for (key, value) in spec.ordered_env() {
         let key = key.trim();
         validate_env_pair(key, value)?;
         insert_environment(&mut cmd.environment, key.to_owned(), value.clone());
@@ -445,6 +446,7 @@ mod tests {
             working_dir: None,
             env: Default::default(),
             env_file: None,
+            env_order: Vec::new(),
             env_files: Vec::new(),
         })
         .unwrap();
@@ -455,6 +457,7 @@ mod tests {
             working_dir: None,
             env: Default::default(),
             env_file: None,
+            env_order: Vec::new(),
             env_files: Vec::new(),
         })
         .unwrap();

@@ -276,6 +276,48 @@ mod tests {
     }
 
     #[test]
+    fn 显式变量顺序往返兼容旧映射且忽略重复和失效顺序项() {
+        let store = temporary_store();
+        for (order, expected) in [
+            ("", vec!["A", "B", "Z"]),
+            (r#"env_order: ["Z", "A", "B"],"#, vec!["Z", "A", "B"]),
+            (r#"env_order: ["Z", "不存在", "Z"],"#, vec!["Z", "A", "B"]),
+        ] {
+            let source = format!(
+                r#"(config_version: 2, tasks: [(
+                id: (1), name: "变量排序", script: (kind: cmd, source: inline("exit /b 0"),
+                    env: {{"A": "", "B": "  原始空格  ", "Z": "多\n行"}}, {order}),
+                schedule: daily(times: ["08:00:00"])
+            )])"#
+            );
+            std::fs::write(store.path(), source).unwrap();
+            let config = store.load().unwrap();
+            assert_eq!(
+                config.tasks[0]
+                    .script
+                    .ordered_env()
+                    .iter()
+                    .map(|(key, _)| key.as_str())
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            store.save(&config).unwrap();
+            let saved = store.load().unwrap();
+            assert_eq!(
+                saved.tasks[0]
+                    .script
+                    .ordered_env()
+                    .iter()
+                    .map(|(key, _)| key.as_str())
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            assert_eq!(saved.tasks[0].script.env, config.tasks[0].script.env);
+        }
+        std::fs::remove_file(store.path()).unwrap();
+    }
+
+    #[test]
     fn 环境文件列表兼容旧配置并保留顺序且校验空路径() {
         let store = temporary_store();
         for (fields, expected) in [
@@ -348,6 +390,7 @@ mod tests {
                     working_dir: Some("data".into()),
                     env: [("MODE".into(), "full".into())].into_iter().collect(),
                     env_file: Some(".env".into()),
+                    env_order: Vec::new(),
                     env_files: vec![".env.local".into(), "config/.env.secrets".into()],
                 },
                 schedule: Schedule::Monthly {

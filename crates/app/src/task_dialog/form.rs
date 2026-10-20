@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 
+use super::feedback::{FormError, FormField};
 use scheduled_task_core::model::{
     ConcurrencyPolicy, DayOfMonth, PyLauncher, RetryPolicy, Schedule, ScriptKind, ScriptSource,
     ScriptSpec, TaskConfig, TaskId,
@@ -80,8 +81,8 @@ pub(super) struct FormValues {
     pub manual_cmd: String,
     pub args: String,
     pub working_dir: String,
-    pub env: String,
-    pub env_files: String,
+    pub env: Vec<(String, String)>,
+    pub env_files: Vec<String>,
     pub schedule_ix: usize,
     pub times: String,
     pub day: String,
@@ -128,8 +129,8 @@ impl FormValues {
             },
             args: task.script.args.join("\n"),
             working_dir: task.script.working_dir.clone().unwrap_or_default(),
-            env: environment_text(&task.script.env),
-            env_files: env_files_text(&task.script),
+            env: environment_entries(&task.script),
+            env_files: task.script.env_file_paths().map(str::to_owned).collect(),
             schedule_ix: match task.schedule {
                 Schedule::Daily { .. } => 0,
                 Schedule::Monthly { .. } => 1,
@@ -175,16 +176,28 @@ impl FormValues {
         self,
         id: TaskId,
         original: Option<&TaskConfig>,
-    ) -> Result<TaskConfig, String> {
+    ) -> Result<TaskConfig, FormError> {
         let name = self.name;
         if name.trim().is_empty() {
-            return Err("任务名称不能为空".into());
+            return Err(FormError::new(FormField::Name, "任务名称不能为空"));
         }
         let path = self.path;
         if !self.source_inline && path.trim().is_empty() {
-            return Err("脚本路径不能为空".into());
+            return Err(FormError::new(FormField::Path, "脚本路径不能为空"));
         }
         let manual_cmd = self.manual_cmd;
+        if self.kind_ix >= KIND_OPTIONS.len() {
+            return Err(FormError::new(FormField::Kind, "请选择有效的脚本类型"));
+        }
+        if self.source_inline && self.kind_ix == 0 {
+            return Err(FormError::new(
+                FormField::Kind,
+                "内联脚本请选择具体脚本类型",
+            ));
+        }
+        if self.kind_ix == 8 && manual_cmd.trim().is_empty() {
+            return Err(FormError::new(FormField::ManualCommand, "手工命令不能为空"));
+        }
         let mut kind = kind_from_ix(self.kind_ix, &manual_cmd);
         if let ScriptKind::Python {
             launcher: PyLauncher::Uv { project },
@@ -217,23 +230,31 @@ impl FormValues {
             &self.working_dir,
             original.map(|task| &task.script.working_dir),
         );
-        let env = if let Some(task) =
-            original.filter(|task| self.env == environment_text(&task.script.env))
+        let (env, env_order) = if let Some(task) =
+            original.filter(|task| self.env == environment_entries(&task.script))
         {
-            task.script.env.clone()
+            (task.script.env.clone(), task.script.env_order.clone())
         } else {
-            parse_env_text(&self.env)?
+            collect_environment(self.env)?
         };
-        let (env_file, env_files) = if let Some(task) =
-            original.filter(|task| self.env_files == env_files_text(&task.script))
+        let (env_file, env_files) = if let Some(task) = original
+            .filter(|task| self.env_files == task.script.env_file_paths().collect::<Vec<_>>())
         {
             (task.script.env_file.clone(), task.script.env_files.clone())
         } else {
+            for (index, path) in self.env_files.iter().enumerate() {
+                if path.contains('\0') {
+                    return Err(FormError::new(
+                        FormField::EnvironmentFile(index),
+                        format!("第 {} 个 .env 文件路径包含无效字符", index + 1),
+                    ));
+                }
+            }
             (
                 None,
                 self.env_files
-                    .lines()
-                    .map(str::trim)
+                    .iter()
+                    .map(|path| path.trim())
                     .filter(|path| !path.is_empty())
                     .map(ToOwned::to_owned)
                     .collect(),
@@ -242,18 +263,24 @@ impl FormValues {
 
         let times_text = self.times;
         let mut times = Vec::new();
-        for part in times_text.split([',', ';', ',', ';', ' ', '\t']) {
+        for part in times_text.split([',', ';', '，', '；', ' ', '\t', '\r', '\n']) {
             let part = part.trim();
             if part.is_empty() {
                 continue;
             }
-            let time: jiff::civil::Time = part
-                .parse()
-                .map_err(|_| format!("时间格式应为 HH:MM:SS,当前有误: {part}"))?;
+            let time: jiff::civil::Time = part.parse().map_err(|_| {
+                FormError::new(
+                    FormField::Times,
+                    format!("时间格式应为 HH:MM:SS,当前有误: {part}"),
+                )
+            })?;
             times.push(time);
         }
         if times.is_empty() {
-            return Err("至少需要一个触发时间(HH:MM:SS)".into());
+            return Err(FormError::new(
+                FormField::Times,
+                "至少需要一个触发时间(HH:MM:SS)",
+            ));
         }
 
         let schedule = match self.schedule_ix {
@@ -262,12 +289,38 @@ impl FormValues {
                 let day: u8 = day_text
                     .trim()
                     .parse()
-                    .map_err(|_| "每月日期应为数字".to_string())?;
-                let day = DayOfMonth::new(day).map_err(|e| e.to_string())?;
+                    .map_err(|_| FormError::new(FormField::Day, "每月日期应为数字"))?;
+                let day = DayOfMonth::new(day)
+                    .map_err(|error| FormError::new(FormField::Day, error.to_string()))?;
                 Schedule::Monthly { day, times }
             }
             2 => Schedule::Custom { times },
-            _ => Schedule::Daily { times },
+            0 => Schedule::Daily { times },
+            _ => {
+                return Err(FormError::new(
+                    FormField::ScheduleType,
+                    "请选择有效的调度类型",
+                ));
+            }
+        };
+
+        let concurrency = match self.concurrency_ix {
+            0 => ConcurrencyPolicy::Parallel,
+            1 => ConcurrencyPolicy::Solo,
+            2 => {
+                let group = self.concurrency_group.trim();
+                if group.is_empty() {
+                    return Err(FormError::new(FormField::Group, "同组互斥需要填写组名"));
+                }
+                original.filter(|task| matches!(&task.concurrency, ConcurrencyPolicy::Group(original) if original == &self.concurrency_group))
+                    .map(|task| task.concurrency.clone()).unwrap_or_else(|| ConcurrencyPolicy::Group(group.to_string()))
+            }
+            _ => {
+                return Err(FormError::new(
+                    FormField::Concurrency,
+                    "请选择有效的并发策略",
+                ));
+            }
         };
 
         let retry = if self.retry_on {
@@ -288,15 +341,16 @@ impl FormValues {
                 };
             Some(RetryPolicy {
                 pattern,
-                window: parse_range(&window_text, 1, 100, 5, "连续次数")?,
-                max_retries: parse_range(&max_text, 1, 10, 3, "最大重试次数")?,
+                window: parse_range(&window_text, 1, 100, 5, "连续次数")
+                    .map_err(|message| FormError::new(FormField::RetryWindow, message))?,
+                max_retries: parse_range(&max_text, 1, 10, 3, "最大重试次数")
+                    .map_err(|message| FormError::new(FormField::MaxRetries, message))?,
                 cooldown: std::time::Duration::from_secs(if self.cooldown.trim().is_empty() {
                     2
                 } else {
-                    self.cooldown
-                        .trim()
-                        .parse()
-                        .map_err(|_| "重试冷却应为非负整数秒".to_string())?
+                    self.cooldown.trim().parse().map_err(|_| {
+                        FormError::new(FormField::Cooldown, "重试冷却应为非负整数秒")
+                    })?
                 }),
             })
         } else {
@@ -305,27 +359,16 @@ impl FormValues {
 
         let timeout = if self.timeout_on {
             let t = self.timeout_min;
-            let minutes: u64 = t.trim().parse().map_err(|_| "超时应为分钟数".to_string())?;
+            let minutes: u64 = t
+                .trim()
+                .parse()
+                .map_err(|_| FormError::new(FormField::Timeout, "超时应为分钟数"))?;
             if !(1..=300).contains(&minutes) {
-                return Err("超时应为 1–300 分钟".into());
+                return Err(FormError::new(FormField::Timeout, "超时应为 1–300 分钟"));
             }
             Some(std::time::Duration::from_secs(minutes * 60))
         } else {
             None
-        };
-
-        let concurrency = match self.concurrency_ix {
-            0 => ConcurrencyPolicy::Parallel,
-            1 => ConcurrencyPolicy::Solo,
-            2 => {
-                let group = self.concurrency_group.trim();
-                if group.is_empty() {
-                    return Err("同组互斥需要填写组名".into());
-                }
-                original.filter(|task| matches!(&task.concurrency, ConcurrencyPolicy::Group(original) if original == &self.concurrency_group))
-                    .map(|task| task.concurrency.clone()).unwrap_or_else(|| ConcurrencyPolicy::Group(group.to_string()))
-            }
-            _ => return Err("请选择有效的并发策略".into()),
         };
 
         let task = TaskConfig {
@@ -345,6 +388,7 @@ impl FormValues {
                 args,
                 working_dir,
                 env,
+                env_order,
                 env_file,
                 env_files,
             },
@@ -354,32 +398,60 @@ impl FormValues {
             enabled: self.enabled,
             concurrency,
         };
-        task.validate()?;
+        task.validate()
+            .map_err(|message| FormError::new(FormField::Name, message))?;
         Ok(task)
     }
 }
 
-pub(super) fn environment_text(environment: &BTreeMap<String, String>) -> String {
-    environment
-        .iter()
-        .map(|(key, value)| format!("{key}={value}"))
-        .collect::<Vec<_>>()
-        .join("\n")
+fn environment_entries(script: &ScriptSpec) -> Vec<(String, String)> {
+    script
+        .ordered_env()
+        .into_iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
 }
 
-pub(super) fn env_files_text(script: &ScriptSpec) -> String {
-    script.env_file_paths().collect::<Vec<_>>().join("\n")
-}
-
-pub(super) fn append_env_files(current: &str, paths: &[std::path::PathBuf]) -> String {
-    let mut text = current.to_owned();
-    for path in paths {
-        if !text.is_empty() && !text.ends_with('\n') {
-            text.push('\n');
+/// 名称完全相同的记录保留最后一条及其位置，值保持原样（包括空格、换行和空值）。
+fn collect_environment(
+    entries: Vec<(String, String)>,
+) -> Result<(BTreeMap<String, String>, Vec<String>), FormError> {
+    let mut values = BTreeMap::new();
+    let mut order = Vec::new();
+    for (index, (key, value)) in entries.into_iter().enumerate() {
+        if key.trim().is_empty() && value.is_empty() {
+            continue;
         }
-        text.push_str(&path.to_string_lossy());
+        let key = key.trim();
+        validate_environment_pair(key, &value, index + 1).map_err(|message| {
+            FormError::new(
+                if valid_environment_key(key) {
+                    FormField::EnvironmentValue(index)
+                } else {
+                    FormField::EnvironmentKey(index)
+                },
+                message,
+            )
+        })?;
+        order.retain(|existing| existing != key);
+        order.push(key.to_string());
+        values.insert(key.to_string(), value);
     }
-    text
+    Ok((values, order))
+}
+
+fn validate_environment_pair(key: &str, value: &str, row: usize) -> Result<(), String> {
+    if !valid_environment_key(key) {
+        return Err(format!("环境变量第 {row} 条的名称无效"));
+    }
+    if value.contains('\0') {
+        return Err(format!("环境变量第 {row} 条的值无效"));
+    }
+    Ok(())
+}
+
+fn valid_environment_key(key: &str) -> bool {
+    !key.is_empty() && !key.contains(['=', '\0', '\r', '\n'])
 }
 
 fn optional_path(value: &str) -> Option<String> {
@@ -395,8 +467,8 @@ fn preserved_path(value: &str, original: Option<&Option<String>>) -> Option<Stri
 }
 
 /// 解析表单中的环境变量文本。每行一个 `KEY=VALUE`,空行和 `#` 注释忽略。
-pub(super) fn parse_env_text(text: &str) -> Result<BTreeMap<String, String>, String> {
-    let mut values = BTreeMap::new();
+pub(super) fn parse_env_text(text: &str) -> Result<Vec<(String, String)>, String> {
+    let mut values = Vec::new();
     for (line_no, raw) in text.lines().enumerate() {
         let line = raw.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -407,14 +479,9 @@ pub(super) fn parse_env_text(text: &str) -> Result<BTreeMap<String, String>, Str
             return Err(format!("环境变量第 {} 行缺少 '='", line_no + 1));
         };
         let key = key.trim();
-        if key.is_empty() || key.contains('=') || key.contains('\0') {
-            return Err(format!("环境变量第 {} 行的名称无效", line_no + 1));
-        }
         let value = value.trim();
-        if value.contains('\0') {
-            return Err(format!("环境变量第 {} 行的值无效", line_no + 1));
-        }
-        values.insert(key.to_string(), value.to_string());
+        validate_environment_pair(key, value, line_no + 1)?;
+        values.push((key.to_string(), value.to_string()));
     }
     Ok(values)
 }
@@ -437,8 +504,8 @@ mod tests {
             manual_cmd: String::new(),
             args: String::new(),
             working_dir: String::new(),
-            env: String::new(),
-            env_files: String::new(),
+            env: Vec::new(),
+            env_files: Vec::new(),
             schedule_ix: 0,
             times: "12:30:00,08:00:00;12:30:00".into(),
             day: String::new(),
@@ -457,8 +524,8 @@ mod tests {
         let mut form = valid_form();
         form.args = " --source\ninput file.txt \n".into();
         form.working_dir = " E:/work ".into();
-        form.env = " MODE=fast\nCOUNT=2 ".into();
-        form.env_files = " .env ".into();
+        form.env = parse_env_text(" MODE=fast\nCOUNT=2 ").unwrap();
+        form.env_files = vec![" .env ".into()];
         let task = form.into_config(TaskId(42), None).unwrap();
         assert_eq!(task.id, TaskId(42));
         assert_eq!(task.name, "定时备份");
@@ -518,7 +585,7 @@ mod tests {
         original.concurrency = ConcurrencyPolicy::Group(" 原组名 ".into());
         let values = FormValues::from_config(&original);
         let saved = values.into_config(original.id, Some(&original)).unwrap();
-        assert_eq!(format!("{saved:?}"), format!("{original:?}"));
+        assert_eq!(saved, original);
         let mut values = FormValues::from_config(&original);
         values.name = "仅修改名称".into();
         let saved = values.into_config(original.id, Some(&original)).unwrap();
@@ -531,12 +598,15 @@ mod tests {
     }
 
     #[test]
-    fn 多环境文件表单保留旧字段与加载顺序并支持修改清空和多选追加() {
+    fn 多环境文件表单保留旧字段与加载顺序并支持修改清空() {
         let mut original = valid_form().into_config(TaskId(42), None).unwrap();
         original.script.env_file = Some("legacy.env".into());
         original.script.env_files = vec!["配置/base.env".into(), "额外 配置.env".into()];
         let values = FormValues::from_config(&original);
-        assert_eq!(values.env_files, "legacy.env\n配置/base.env\n额外 配置.env");
+        assert_eq!(
+            values.env_files,
+            vec!["legacy.env", "配置/base.env", "额外 配置.env"]
+        );
         let saved = values.into_config(original.id, Some(&original)).unwrap();
         assert_eq!(
             format!("{:?}", saved.script),
@@ -548,7 +618,12 @@ mod tests {
         assert_eq!(saved.script.env_file, original.script.env_file);
         assert_eq!(saved.script.env_files, original.script.env_files);
         let mut values = FormValues::from_config(&original);
-        values.env_files = " base.env \n\n config/local.env\nbase.env\n".into();
+        values.env_files = vec![
+            " base.env ".into(),
+            "".into(),
+            " config/local.env".into(),
+            "base.env".into(),
+        ];
         let saved = values.into_config(original.id, Some(&original)).unwrap();
         assert!(saved.script.env_file.is_none());
         assert_eq!(
@@ -559,20 +634,6 @@ mod tests {
         values.env_files.clear();
         let saved = values.into_config(original.id, Some(&original)).unwrap();
         assert!(saved.script.env_file.is_none() && saved.script.env_files.is_empty());
-        let paths = [
-            std::path::PathBuf::from("first.env"),
-            std::path::PathBuf::from("配置 空格.env"),
-        ];
-        assert_eq!(
-            append_env_files("legacy.env", &paths),
-            "legacy.env\nfirst.env\n配置 空格.env"
-        );
-        assert_eq!(
-            append_env_files("legacy.env\n", &paths),
-            "legacy.env\nfirst.env\n配置 空格.env"
-        );
-        assert_eq!(append_env_files("", &paths), "first.env\n配置 空格.env");
-        assert_eq!(append_env_files("draft.env", &[]), "draft.env");
     }
 
     #[test]
@@ -604,7 +665,7 @@ mod tests {
         form.concurrency_ix = 2;
         form.concurrency_group = "   ".into();
         assert_eq!(
-            form.into_config(TaskId(0), None).unwrap_err(),
+            form.into_config(TaskId(0), None).unwrap_err().message,
             "同组互斥需要填写组名"
         );
         let mut form = valid_form();
@@ -660,7 +721,7 @@ mod tests {
             form.retry_on = true;
             form.window_n = value.into();
             assert_eq!(
-                form.into_config(TaskId(0), None).unwrap_err(),
+                form.into_config(TaskId(0), None).unwrap_err().message,
                 "连续次数 应在 1–100 之间"
             );
         }
@@ -669,7 +730,7 @@ mod tests {
             form.retry_on = true;
             form.max_retries = value.into();
             assert_eq!(
-                form.into_config(TaskId(0), None).unwrap_err(),
+                form.into_config(TaskId(0), None).unwrap_err().message,
                 "最大重试次数 应在 1–10 之间"
             );
         }
@@ -678,7 +739,7 @@ mod tests {
             form.timeout_on = true;
             form.timeout_min = value.into();
             assert_eq!(
-                form.into_config(TaskId(0), None).unwrap_err(),
+                form.into_config(TaskId(0), None).unwrap_err().message,
                 "超时应为 1–300 分钟"
             );
         }
@@ -687,13 +748,191 @@ mod tests {
     #[test]
     fn parses_environment_lines_and_ignores_comments() {
         let env = parse_env_text("# 注释\nexport A=1\nB=hello=world\nA=2\n").unwrap();
-        assert_eq!(env.get("A"), Some(&"2".to_string()));
-        assert_eq!(env.get("B"), Some(&"hello=world".to_string()));
+        assert_eq!(
+            env,
+            vec![
+                ("A".into(), "1".into()),
+                ("B".into(), "hello=world".into()),
+                ("A".into(), "2".into())
+            ]
+        );
     }
 
     #[test]
     fn rejects_malformed_environment_lines() {
         assert!(parse_env_text("NO_VALUE").is_err());
         assert!(parse_env_text("=missing").is_err());
+    }
+
+    #[test]
+    fn 环境条目重排后保存保留顺序和原始空格换行值() {
+        let mut form = valid_form();
+        form.env = vec![("Z".into(), " 原始值\n ".into()), ("A".into(), "".into())];
+        let original = form.into_config(TaskId(42), None).unwrap();
+        assert_eq!(original.script.env_order, ["Z", "A"]);
+        let mut form = FormValues::from_config(&original);
+        form.env.reverse();
+        form.env.push((String::new(), String::new()));
+        let saved = form.into_config(original.id, Some(&original)).unwrap();
+        assert_eq!(saved.script.env_order, ["A", "Z"]);
+        assert_eq!(saved.script.env, original.script.env);
+        assert_eq!(
+            FormValues::from_config(&saved).env,
+            vec![("A".into(), "".into()), ("Z".into(), " 原始值\n ".into())]
+        );
+    }
+
+    #[test]
+    fn 重复环境变量保存最后一条及其位置且清空移除顺序() {
+        let mut form = valid_form();
+        form.env = parse_env_text("Z=first\nA=middle\nZ=last").unwrap();
+        let original = form.into_config(TaskId(42), None).unwrap();
+        assert_eq!(original.script.env_order, ["A", "Z"]);
+        assert_eq!(original.script.env["Z"], "last");
+        let mut form = FormValues::from_config(&original);
+        form.env.clear();
+        let saved = form.into_config(original.id, Some(&original)).unwrap();
+        assert!(saved.script.env.is_empty() && saved.script.env_order.is_empty());
+    }
+
+    #[test]
+    fn 批量解析整体验证且拒绝逐条输入无效名称和值() {
+        assert!(
+            parse_env_text("GOOD=1\nBROKEN\nNEXT=2")
+                .unwrap_err()
+                .contains("第 2 行")
+        );
+        assert!(parse_env_text("GOOD=1\nBAD=nu\0l").is_err());
+        for (key, value) in [
+            ("", "有值"),
+            ("BAD=KEY", "value"),
+            ("BAD\nKEY", "value"),
+            ("KEY", "\0"),
+        ] {
+            let mut form = valid_form();
+            form.env = vec![(key.into(), value.into())];
+            assert!(form.into_config(TaskId(42), None).is_err());
+        }
+    }
+
+    #[test]
+    fn 跨页校验定位到具体字段和环境条目() {
+        use super::super::feedback::FormPage;
+        type InvalidCase = (fn(&mut FormValues), FormField, FormPage);
+        let cases: &[InvalidCase] = &[
+            (|v| v.name.clear(), FormField::Name, FormPage::Basics),
+            (|v| v.path.clear(), FormField::Path, FormPage::Basics),
+            (|v| v.kind_ix = 99, FormField::Kind, FormPage::Basics),
+            (
+                |v| v.source_inline = true,
+                FormField::Kind,
+                FormPage::Basics,
+            ),
+            (
+                |v| v.kind_ix = 8,
+                FormField::ManualCommand,
+                FormPage::Basics,
+            ),
+            (
+                |v| v.env = vec![("OK".into(), "1".into()), ("BAD=KEY".into(), "2".into())],
+                FormField::EnvironmentKey(1),
+                FormPage::Environment,
+            ),
+            (
+                |v| v.env = vec![("OK".into(), "1".into()), ("BAD".into(), "\0".into())],
+                FormField::EnvironmentValue(1),
+                FormPage::Environment,
+            ),
+            (
+                |v| v.env_files = vec!["ok.env".into(), "bad\0.env".into()],
+                FormField::EnvironmentFile(1),
+                FormPage::Environment,
+            ),
+            (
+                |v| v.times = "25:00:00".into(),
+                FormField::Times,
+                FormPage::Schedule,
+            ),
+            (
+                |v| v.schedule_ix = 99,
+                FormField::ScheduleType,
+                FormPage::Schedule,
+            ),
+            (
+                |v| {
+                    v.schedule_ix = 1;
+                    v.day = "32".into();
+                },
+                FormField::Day,
+                FormPage::Schedule,
+            ),
+            (
+                |v| v.concurrency_ix = 2,
+                FormField::Group,
+                FormPage::Schedule,
+            ),
+            (
+                |v| {
+                    v.retry_on = true;
+                    v.window_n = "0".into();
+                },
+                FormField::RetryWindow,
+                FormPage::Recovery,
+            ),
+            (
+                |v| {
+                    v.retry_on = true;
+                    v.max_retries = "11".into();
+                },
+                FormField::MaxRetries,
+                FormPage::Recovery,
+            ),
+            (
+                |v| {
+                    v.retry_on = true;
+                    v.cooldown = "-1".into();
+                },
+                FormField::Cooldown,
+                FormPage::Recovery,
+            ),
+            (
+                |v| {
+                    v.timeout_on = true;
+                    v.timeout_min = "0".into();
+                },
+                FormField::Timeout,
+                FormPage::Recovery,
+            ),
+        ];
+        for (mutate, field, page) in cases {
+            let mut form = valid_form();
+            mutate(&mut form);
+            let error = form.into_config(TaskId(42), None).unwrap_err();
+            assert_eq!(error.field, *field, "{}", error.message);
+            assert_eq!(error.field.page(), *page);
+        }
+    }
+
+    #[test]
+    fn 多页同时无效时先定位调度再定位恢复选项() {
+        let mut form = valid_form();
+        form.concurrency_ix = 2;
+        form.retry_on = true;
+        form.window_n = "0".into();
+        assert_eq!(
+            form.into_config(TaskId(42), None).unwrap_err().field,
+            FormField::Group
+        );
+    }
+
+    #[test]
+    fn 时间输入支持中文分隔符并保持原始触发顺序() {
+        let mut form = valid_form();
+        form.times = "12:30:00，08:00:00；12:30:00".into();
+        let task = form.into_config(TaskId(42), None).unwrap();
+        let times = task.schedule.times();
+        assert_eq!(times.len(), 3);
+        assert_eq!(times[0], times[2]);
+        assert!(times[0] > times[1]);
     }
 }

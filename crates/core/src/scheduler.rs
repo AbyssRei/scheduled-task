@@ -149,6 +149,7 @@ mod tests {
                 working_dir: None,
                 env: Default::default(),
                 env_file: None,
+                env_order: Vec::new(),
                 env_files: Vec::new(),
             },
             schedule,

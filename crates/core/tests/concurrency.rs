@@ -16,6 +16,7 @@ fn task(id: u64, policy: ConcurrencyPolicy) -> TaskConfig {
             working_dir: None,
             env: Default::default(),
             env_file: None,
+            env_order: Vec::new(),
             env_files: Vec::new(),
         },
         schedule: Schedule::Custom { times: vec![] },
@@ -117,6 +118,7 @@ mod lifecycle {
             working_dir: None,
             env: Default::default(),
             env_file: None,
+            env_order: Vec::new(),
             env_files: Vec::new(),
         };
         task

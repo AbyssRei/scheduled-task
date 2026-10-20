@@ -57,6 +57,7 @@ fn task(id: u64, kind: ScriptKind, script: String) -> TaskConfig {
             working_dir: None,
             env: Default::default(),
             env_file: None,
+            env_order: Vec::new(),
             env_files: Vec::new(),
         },
         schedule: Schedule::Monthly {

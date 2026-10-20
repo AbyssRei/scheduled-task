@@ -7,30 +7,48 @@
 //! 范围校验:window 1–100、max_retries 1–10、
 //! timeout 1–300、day 1–31。
 
+mod entries;
+mod feedback;
 mod form;
 mod layout;
+mod records;
 
+use std::cell::Cell;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::combobox::{ComboboxEvent, ComboboxState};
-use gpui_kit::component::dialog::DialogDescription;
-use gpui_kit::component::input::{InputState, TextareaState};
-use gpui_kit::{App, AppContext as _, Context, Entity, ParentElement as _, PathPromptOptions, px};
+use gpui_kit::component::input::{InputEvent, InputState, TextareaState};
+use gpui_kit::{
+    App, AppContext as _, Context, Entity, ParentElement as _, PathPromptOptions, ScrollAnchor,
+    ScrollHandle, Styled, px,
+};
 use scheduled_task_core::model::{Schedule, ScriptKind, ScriptSource, TaskConfig, TaskId};
 
 use crate::bridge::AppCore;
 use crate::widgets::{PickDelegate, PickItem};
+use entries::EnvInputs;
+use feedback::{FormError, FormField, FormPage};
 use form::{
-    CONCURRENCY_OPTIONS, FormValues, KIND_OPTIONS, SCHEDULE_OPTIONS, append_env_files,
-    concurrency_fields, ix_from_kind,
+    CONCURRENCY_OPTIONS, FormValues, KIND_OPTIONS, SCHEDULE_OPTIONS, concurrency_fields,
+    ix_from_kind,
 };
+use records::Records;
 
 /// 表单视图(对话框内容)。
 pub struct TaskDialogView {
     core: Arc<AppCore>,
     editing: Option<TaskConfig>,
     handle: gpui_kit::AnyWindowHandle,
+    page: FormPage,
+    page_scrolls: [ScrollHandle; 4],
+    error_scroll: Option<ScrollAnchor>,
+    error: Option<FormError>,
+    save_error: Option<String>,
+    /// 当前拖动的条目；拖动预览显示时隐藏原条目，避免两份控件同时出现。
+    dragging: Option<entries::ActiveRecordDrag>,
+    record_lists: [Rc<Cell<entries::ListGeometry>>; 2],
 
     name: Entity<InputState>,
     path: Entity<InputState>,
@@ -43,8 +61,8 @@ pub struct TaskDialogView {
     manual_cmd: Entity<InputState>,
     args: Entity<TextareaState>,
     working_dir: Entity<InputState>,
-    env: Entity<TextareaState>,
-    env_files: Entity<TextareaState>,
+    env: Records<EnvInputs>,
+    env_files: Records<Entity<InputState>>,
     schedule_state: Entity<ComboboxState<PickDelegate>>,
     schedule_ix: usize,
     times: Entity<InputState>,
@@ -68,11 +86,18 @@ impl TaskDialogView {
         cx: &mut Context<Self>,
         placeholder: &str,
     ) -> Entity<InputState> {
-        cx.new(|cx| {
+        let input = cx.new(|cx| {
             let mut state = InputState::new(window, cx);
             state.set_placeholder(placeholder, window, cx);
             state
+        });
+        cx.subscribe_in(&input, window, |this, _, event: &InputEvent, _, cx| {
+            if matches!(event, InputEvent::Change) {
+                this.draft_changed(cx);
+            }
         })
+        .detach();
+        input
     }
 
     fn new_textarea(
@@ -80,11 +105,18 @@ impl TaskDialogView {
         cx: &mut Context<Self>,
         placeholder: &str,
     ) -> Entity<TextareaState> {
-        cx.new(|cx| {
+        let input = cx.new(|cx| {
             let mut state = TextareaState::new(window, cx);
             state.set_placeholder(placeholder, window, cx);
             state
+        });
+        cx.subscribe_in(&input, window, |this, _, event: &InputEvent, _, cx| {
+            if matches!(event, InputEvent::Change) {
+                this.draft_changed(cx);
+            }
         })
+        .detach();
+        input
     }
 
     fn pick_state(
@@ -114,17 +146,7 @@ impl TaskDialogView {
 
     /// 打开"添加任务"对话框。
     pub fn open_new(core: Arc<AppCore>, window: &mut gpui_kit::Window, cx: &mut App) {
-        let handle = window.window_handle();
-        let view = cx.new(|cx| Self::form(core, None, handle, window, cx));
-        window.open_dialog(cx, move |dialog, _, _| {
-            let view = view.clone();
-            dialog
-                .title("添加任务")
-                .w(px(640.))
-                .footer(Self::actions(view.clone()))
-                // 使用对话框内置的限高滚动区，避免长表单超出窗口。
-                .child(view)
-        });
+        Self::open(core, None, window, cx);
     }
 
     /// 打开"编辑任务"对话框。
@@ -134,15 +156,35 @@ impl TaskDialogView {
         window: &mut gpui_kit::Window,
         cx: &mut App,
     ) {
+        Self::open(core, Some(task), window, cx);
+    }
+
+    fn open(
+        core: Arc<AppCore>,
+        task: Option<TaskConfig>,
+        window: &mut gpui_kit::Window,
+        cx: &mut App,
+    ) {
+        if window.has_active_dialog(cx) {
+            return;
+        }
+        let title = if task.is_some() {
+            "编辑任务"
+        } else {
+            "添加任务"
+        };
         let handle = window.window_handle();
-        let view = cx.new(|cx| Self::form(core, Some(task), handle, window, cx));
+        let view = cx.new(|cx| Self::form(core, task, handle, window, cx));
         window.open_dialog(cx, move |dialog, _, _| {
-            let view = view.clone();
+            let content = view.clone();
+            let confirm = view.clone();
             dialog
-                .title("编辑任务")
-                .w(px(640.))
-                .footer(Self::actions(view.clone()))
-                .child(view)
+                .title(title)
+                .w(px(760.))
+                .h(px(650.))
+                .overlay_closable(false)
+                .on_ok(move |_, window, cx| confirm.update(cx, |this, cx| this.save(window, cx)))
+                .content(move |area, _, _| area.min_h_0().overflow_hidden().child(content.clone()))
         });
     }
 
@@ -153,6 +195,19 @@ impl TaskDialogView {
         window: &mut gpui_kit::Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        cx.observe_window_activation(window, |this, window, cx| {
+            if !window.is_window_active() && this.dragging.take().is_some() {
+                cx.stop_active_drag(window);
+                cx.notify();
+            }
+        })
+        .detach();
+        cx.on_release_in(window, |this, window, cx| {
+            if this.dragging.is_some() {
+                cx.stop_active_drag(window);
+            }
+        })
+        .detach();
         let t = editing.as_ref();
         let kind_ix = t.map_or(0, |t| ix_from_kind(&t.script.kind));
         let (concurrency_ix, group) =
@@ -176,12 +231,25 @@ impl TaskDialogView {
         let manual_cmd = Self::new_input(window, cx, "手工命令,{script} 代表脚本路径");
         let args = Self::new_textarea(window, cx, "每行一个参数,空行忽略");
         let working_dir = Self::new_input(window, cx, "留空则使用脚本所在目录");
-        let env = Self::new_textarea(window, cx, "每行一个 KEY=VALUE,空行和 # 注释忽略");
-        let env_files = Self::new_textarea(
-            window,
-            cx,
-            "每行一个 .env 路径，后面的文件覆盖前面的同名变量",
-        );
+        let mut env = Records::default();
+        let mut env_files = Records::default();
+        if let Some(task) = t {
+            env.insert_after(
+                None,
+                task.script
+                    .ordered_env()
+                    .into_iter()
+                    .map(|(key, value)| Self::env_inputs(key.clone(), value.clone(), window, cx))
+                    .collect::<Vec<_>>(),
+            );
+            env_files.insert_after(
+                None,
+                task.script
+                    .env_file_paths()
+                    .map(|path| Self::env_file_input(path.to_owned(), window, cx))
+                    .collect::<Vec<_>>(),
+            );
+        }
         let times = Self::new_input(window, cx, "多个时间用逗号分隔,如 08:00:00,12:30:00");
         let day = Self::new_input(window, cx, "1–31");
         let pattern = Self::new_textarea(window, cx, "每行一个候选模式;留空=核心内容一致");
@@ -213,17 +281,6 @@ impl TaskDialogView {
             if let Some(value) = &t.script.working_dir {
                 working_dir.update(cx, |st, cx| st.set_value(value.clone(), window, cx));
             }
-            if !t.script.env.is_empty() {
-                let text = t
-                    .script
-                    .env
-                    .iter()
-                    .map(|(key, value)| format!("{key}={value}"))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                env.update(cx, |st, cx| st.set_value(text, window, cx));
-            }
-            env_files.update(cx, |st, cx| st.set_value(values.env_files, window, cx));
             times.update(cx, |st, cx| {
                 let joined = t
                     .schedule
@@ -261,7 +318,7 @@ impl TaskDialogView {
             |this, _, event: &ComboboxEvent<PickDelegate>, _window, cx| {
                 if let Some(v) = event_values(event).first() {
                     this.concurrency_ix = *v;
-                    cx.notify();
+                    this.draft_changed(cx);
                 }
             },
         )
@@ -272,7 +329,7 @@ impl TaskDialogView {
             |this, _, event: &ComboboxEvent<PickDelegate>, _window, cx| {
                 if let Some(v) = event_values(event).first() {
                     this.kind_ix = *v;
-                    cx.notify();
+                    this.draft_changed(cx);
                 }
             },
         )
@@ -283,7 +340,7 @@ impl TaskDialogView {
             |this, _, event: &ComboboxEvent<PickDelegate>, _window, cx| {
                 if let Some(v) = event_values(event).first() {
                     this.schedule_ix = *v;
-                    cx.notify();
+                    this.draft_changed(cx);
                 }
             },
         )
@@ -293,6 +350,13 @@ impl TaskDialogView {
             core,
             editing,
             handle,
+            page: FormPage::Basics,
+            page_scrolls: std::array::from_fn(|_| ScrollHandle::new()),
+            error_scroll: None,
+            error: None,
+            save_error: None,
+            dragging: None,
+            record_lists: std::array::from_fn(|_| Rc::default()),
             name,
             path,
             source_inline,
@@ -323,31 +387,90 @@ impl TaskDialogView {
         }
     }
 
-    /// 校验并构造 TaskConfig;错误信息为中文,弹 alert 提示。
-    fn save(&mut self, window: &mut gpui_kit::Window, cx: &mut App) {
-        let result = self.collect_config(cx).and_then(|task| {
-            if self.editing.is_some() {
-                self.core.update(task)
-            } else {
-                self.core.add(task).map(|_| ())
+    fn draft_changed(&mut self, cx: &mut Context<Self>) {
+        self.error = None;
+        self.error_scroll = None;
+        self.save_error = None;
+        cx.notify();
+    }
+
+    /// 按全部页面校验，失败定位字段；返回是否可以关闭对话框。
+    fn save(&mut self, window: &mut gpui_kit::Window, cx: &mut Context<Self>) -> bool {
+        self.error = None;
+        self.save_error = None;
+        let task = match self.collect_config(cx) {
+            Ok(task) => task,
+            Err(error) => {
+                self.page = error.field.page();
+                let anchor = ScrollAnchor::for_handle(self.page_scrolls[self.page.index()].clone());
+                self.error_scroll = Some(anchor.clone());
+                // 等待目标页挂载并记录几何位置后，再滚动到错误字段。
+                window.on_next_frame(move |window, cx| anchor.scroll_to(window, cx));
+                self.focus_error(error.field, window, cx);
+                self.error = Some(error);
+                cx.notify();
+                return false;
             }
-        });
+        };
+        // 原样编辑不落盘或重载任务，避免无意义地影响调度。
+        if self.editing.as_ref() == Some(&task) {
+            return true;
+        }
+        let result = if self.editing.is_some() {
+            self.core.update(task)
+        } else {
+            self.core.add(task).map(|_| ())
+        };
         match result {
-            Ok(()) => window.close_dialog(cx),
-            Err(msg) => {
-                let msg = msg.clone();
-                window.open_alert_dialog(cx, move |alert, _, _| {
-                    let msg = msg.clone();
-                    alert
-                        .title("保存失败")
-                        .child(DialogDescription::new().child(msg))
-                        .show_cancel(false)
-                });
+            Ok(()) => true,
+            Err(message) => {
+                self.save_error = Some(format!("保存失败：{message}"));
+                cx.notify();
+                false
             }
         }
     }
 
-    fn collect_config(&self, cx: &App) -> Result<TaskConfig, String> {
+    fn focus_error(&self, field: FormField, window: &mut gpui_kit::Window, cx: &mut Context<Self>) {
+        let input = match field {
+            FormField::Name => Some(&self.name),
+            FormField::Path => Some(&self.path),
+            FormField::ManualCommand => Some(&self.manual_cmd),
+            FormField::Times => Some(&self.times),
+            FormField::Day => Some(&self.day),
+            FormField::Group => Some(&self.concurrency_group),
+            FormField::RetryWindow => Some(&self.window_n),
+            FormField::MaxRetries => Some(&self.max_retries),
+            FormField::Cooldown => Some(&self.cooldown),
+            FormField::Timeout => Some(&self.timeout_min),
+            FormField::EnvironmentKey(index) => self.env.rows.get(index).map(|row| &row.value.key),
+            FormField::EnvironmentFile(index) => {
+                self.env_files.rows.get(index).map(|row| &row.value)
+            }
+            _ => None,
+        };
+        if let Some(input) = input {
+            input.update(cx, |state, cx| state.focus(window, cx));
+        }
+        let combobox = match field {
+            FormField::Kind => Some(&self.kind_state),
+            FormField::ScheduleType => Some(&self.schedule_state),
+            FormField::Concurrency => Some(&self.concurrency_state),
+            _ => None,
+        };
+        if let Some(combobox) = combobox {
+            combobox.update(cx, |state, cx| state.focus(window, cx));
+        }
+        if let FormField::EnvironmentValue(index) = field
+            && let Some(row) = self.env.rows.get(index)
+        {
+            row.value
+                .value
+                .update(cx, |state, cx| state.focus(window, cx));
+        }
+    }
+
+    fn collect_config(&self, cx: &App) -> Result<TaskConfig, FormError> {
         let values = FormValues {
             source_inline: self.source_inline,
             inline_content: self.inline_content.read(cx).value().to_string(),
@@ -361,8 +484,23 @@ impl TaskDialogView {
             manual_cmd: self.manual_cmd.read(cx).value().to_string(),
             args: self.args.read(cx).value().to_string(),
             working_dir: self.working_dir.read(cx).value().to_string(),
-            env: self.env.read(cx).value().to_string(),
-            env_files: self.env_files.read(cx).value().to_string(),
+            env: self
+                .env
+                .rows
+                .iter()
+                .map(|row| {
+                    (
+                        row.value.key.read(cx).value().to_string(),
+                        row.value.value.read(cx).value().to_string(),
+                    )
+                })
+                .collect(),
+            env_files: self
+                .env_files
+                .rows
+                .iter()
+                .map(|row| row.value.read(cx).value().to_string())
+                .collect(),
             schedule_ix: self.schedule_ix,
             times: self.times.read(cx).value().to_string(),
             day: self.day.read(cx).value().to_string(),
@@ -380,22 +518,35 @@ impl TaskDialogView {
         )
     }
 
-    fn browse(&mut self, _window: &mut gpui_kit::Window, cx: &mut App) {
+    fn browse(&mut self, _window: &mut gpui_kit::Window, cx: &mut Context<Self>) {
         let rx = cx.prompt_for_paths(PathPromptOptions {
             files: true,
             directories: false,
             multiple: false,
             prompt: Some("选择脚本文件".into()),
         });
-        let path_input = self.path.clone();
+        let view = cx.entity().downgrade();
         let handle = self.handle;
-        cx.spawn(async move |cx| {
+        cx.spawn(async move |_, cx| {
             if let Ok(Ok(Some(paths))) = rx.await
                 && let Some(p) = paths.first()
             {
                 let text = p.to_string_lossy().into_owned();
+                let suggested_name = p
+                    .file_stem()
+                    .map(|stem| stem.to_string_lossy().into_owned());
                 let _ = handle.update(cx, |_, window, cx| {
-                    path_input.update(cx, |st, cx| st.set_value(text, window, cx));
+                    let _ = view.update(cx, |this, cx| {
+                        this.path
+                            .update(cx, |state, cx| state.set_value(text, window, cx));
+                        if this.editing.is_none()
+                            && this.name.read(cx).value().trim().is_empty()
+                            && let Some(name) = suggested_name
+                        {
+                            this.name
+                                .update(cx, |state, cx| state.set_value(name, window, cx));
+                        }
+                    });
                 });
             }
         })
@@ -424,21 +575,31 @@ impl TaskDialogView {
         .detach();
     }
 
-    fn browse_env_files(&mut self, cx: &mut App) {
+    fn browse_env_files(&mut self, after: Option<u64>, cx: &mut Context<Self>) {
         let rx = cx.prompt_for_paths(PathPromptOptions {
             files: true,
             directories: false,
             multiple: true,
-            prompt: Some("选择要追加的 .env 文件（可多选）".into()),
+            prompt: Some("选择要插入的 .env 文件（可多选）".into()),
         });
-        let path_input = self.env_files.clone();
+        let view = cx.entity().downgrade();
         let handle = self.handle;
-        cx.spawn(async move |cx| {
+        cx.spawn(async move |_, cx| {
             if let Ok(Ok(Some(paths))) = rx.await {
                 let _ = handle.update(cx, |_, window, cx| {
-                    path_input.update(cx, |st, cx| {
-                        let text = append_env_files(&st.value(), &paths);
-                        st.set_value(text, window, cx);
+                    let _ = view.update(cx, |this, cx| {
+                        let inputs = paths
+                            .into_iter()
+                            .map(|path| {
+                                Self::env_file_input(
+                                    path.to_string_lossy().into_owned(),
+                                    window,
+                                    cx,
+                                )
+                            })
+                            .collect::<Vec<_>>();
+                        this.env_files.insert_after(after, inputs);
+                        this.draft_changed(cx);
                     });
                 });
             }

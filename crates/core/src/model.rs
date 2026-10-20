@@ -25,7 +25,7 @@ impl std::fmt::Display for TaskId {
 }
 
 /// 任务配置(强类型)。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskConfig {
     pub id: TaskId,
     pub name: String,
@@ -136,7 +136,7 @@ mod timeout_secs_opt {
 /// 调度规则。
 ///
 /// monthly 按真实月历触发:当月无指定日期则跳过(见 scheduler)。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Schedule {
     Daily { times: Vec<Time> },
@@ -191,7 +191,7 @@ impl DayOfMonth {
 }
 
 /// 脚本规格:类型 + 来源。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScriptSpec {
     pub kind: ScriptKind,
     pub source: ScriptSource,
@@ -204,6 +204,9 @@ pub struct ScriptSpec {
     /// 显式环境变量，优先级高于所有 .env 文件，空值表示设置为空字符串。
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    /// 显式变量的显示和应用顺序；未列出的键按名称追加，兼容旧配置。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub env_order: Vec<String>,
     /// 兼容旧配置的单文件入口，先于 env_files 加载；相对路径按最终工作目录解析。
     #[serde(default)]
     pub env_file: Option<String>,
@@ -213,6 +216,16 @@ pub struct ScriptSpec {
 }
 
 impl ScriptSpec {
+    pub fn ordered_env(&self) -> Vec<(&String, &String)> {
+        let mut seen = std::collections::BTreeSet::new();
+        self.env_order
+            .iter()
+            .filter_map(|key| self.env.get_key_value(key))
+            .chain(self.env.iter())
+            .filter(|(key, _)| seen.insert(*key))
+            .collect()
+    }
+
     pub fn env_file_paths(&self) -> impl Iterator<Item = &str> {
         self.env_file
             .iter()
@@ -266,7 +279,7 @@ pub enum PyLauncher {
 }
 
 /// 脚本来源:文件路径或内联内容(内联写临时文件再执行)。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ScriptSource {
     File(String),
@@ -278,7 +291,7 @@ pub enum ScriptSource {
 /// pattern 每行一个候选(OR 语义,空白归一化子串匹配,
 /// 空 = 窗口内核心内容一致);window 为连续次数;
 /// max_retries 为最大重试次数;cooldown 为重试间隔,默认 2s。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RetryPolicy {
     #[serde(default)]
     pub pattern: String,
