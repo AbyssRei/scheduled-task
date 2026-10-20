@@ -110,6 +110,16 @@ impl AppCore {
         self.daemon.states().get_status(id)
     }
 
+    pub fn last_run(&self, id: TaskId) -> Option<scheduled_task_core::daemon::ExecutionRecord> {
+        self.daemon.last_run(id)
+    }
+    pub fn next_fire(&self, id: TaskId) -> Option<jiff::civil::DateTime> {
+        self.daemon.next_fire(id)
+    }
+    pub fn queue_reason(&self, id: TaskId) -> Option<String> {
+        self.daemon.queue_reason(id)
+    }
+
     pub fn add(&self, mut task: TaskConfig) -> Result<TaskId, String> {
         task.id = TaskId(
             self.next_id

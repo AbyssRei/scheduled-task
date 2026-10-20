@@ -27,6 +27,34 @@ impl FireTracker {
         Self::default()
     }
 
+    /// 下次尚未处理的本地计划时刻；仅预览，不修改去重标记。
+    pub fn next_fire(&self, task: &TaskConfig, now: &Zoned) -> Option<jiff::civil::DateTime> {
+        if !task.enabled || task.schedule.times().is_empty() {
+            return None;
+        }
+        let mut date = now.date();
+        for _ in 0..=366 {
+            if task
+                .schedule
+                .monthly_day()
+                .is_none_or(|day| date.day() == day.get() as i8)
+                && let Some(time) = task
+                    .schedule
+                    .times()
+                    .iter()
+                    .filter(|time| {
+                        (date > now.date() || **time >= now.time())
+                            && !self.fired.contains(&(task.id, **time, date))
+                    })
+                    .min()
+            {
+                return Some(date.to_datetime(*time));
+            }
+            date = date.tomorrow().ok()?;
+        }
+        None
+    }
+
     /// 判断此刻该任务是否应触发。
     ///
     /// 规则:当前本地时刻 >= 某个配置时刻,且该 (任务, 时刻) 今天尚未触发。
@@ -141,6 +169,36 @@ mod tests {
         Schedule::Daily {
             times: times.iter().map(|t| t.parse().unwrap()).collect(),
         }
+    }
+
+    #[test]
+    fn 计划预览排序时刻并保留当日去重且跳过不存在的月日期() {
+        let mut tracker = FireTracker::new();
+        let t = task(1, daily(&["18:00:00", "08:00:00"]));
+        let morning = zoned(2026, 10, 14, 7, 0, 0);
+        assert_eq!(
+            tracker.next_fire(&t, &morning).unwrap().time(),
+            "08:00:00".parse::<Time>().unwrap()
+        );
+        assert!(tracker.should_fire(&t, &zoned(2026, 10, 14, 8, 0, 0)));
+        assert_eq!(
+            tracker.next_fire(&t, &morning).unwrap().time(),
+            "18:00:00".parse::<Time>().unwrap()
+        );
+        let monthly = task(
+            2,
+            Schedule::Monthly {
+                day: DayOfMonth::new(31).unwrap(),
+                times: vec!["08:00:00".parse().unwrap()],
+            },
+        );
+        let next = tracker
+            .next_fire(&monthly, &zoned(2026, 1, 31, 9, 0, 0))
+            .unwrap();
+        assert_eq!(next.date(), jiff::civil::date(2026, 3, 31));
+        let mut disabled = t.clone();
+        disabled.enabled = false;
+        assert!(tracker.next_fire(&disabled, &morning).is_none());
     }
 
     #[test]

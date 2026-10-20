@@ -55,6 +55,25 @@ struct ActiveRun {
     /// 运行中的策略保持启动时快照,编辑只影响下一次执行。
     policy: ConcurrencyPolicy,
     cancel: Arc<AtomicBool>,
+    started_at: jiff::Timestamp,
+    started: Instant,
+}
+
+/// 最近一轮执行的结果与当前可调度状态分开保存，不参与配置持久化。
+#[derive(Debug, Clone)]
+pub struct ExecutionRecord {
+    pub started_at: jiff::Timestamp,
+    pub finished_at: jiff::Timestamp,
+    pub duration: Duration,
+    pub returncode: i32,
+    pub stopped: bool,
+    pub retry_triggered: bool,
+}
+
+impl ExecutionRecord {
+    pub fn succeeded(&self) -> bool {
+        !self.stopped && self.returncode == 0 && !self.retry_triggered
+    }
 }
 
 struct AdmissionState {
@@ -76,6 +95,7 @@ pub struct Daemon {
     tick_count: Arc<AtomicU64>,
     /// 锁顺序始终为 admission → tasks → tracker/状态机。
     admission: Arc<Mutex<AdmissionState>>,
+    last_runs: Arc<Mutex<HashMap<TaskId, ExecutionRecord>>>,
 }
 
 pub fn spawn_channel() -> (EventSender, EventReceiver) {
@@ -85,6 +105,7 @@ pub fn spawn_channel() -> (EventSender, EventReceiver) {
 impl Daemon {
     pub fn new(event_tx: EventSender) -> Self {
         Self {
+            last_runs: Arc::new(Mutex::new(HashMap::new())),
             states: Arc::new(TaskStateManager::new()),
             tasks: Arc::new(Mutex::new(Vec::new())),
             tracker: Arc::new(Mutex::new(FireTracker::new())),
@@ -143,6 +164,10 @@ impl Daemon {
     pub fn reload_preserving(&self, tasks: Vec<TaskConfig>) {
         let mut admission = self.admission.lock().unwrap();
         let old = std::mem::replace(&mut *self.tasks.lock().unwrap(), tasks.clone());
+        self.last_runs
+            .lock()
+            .unwrap()
+            .retain(|id, _| tasks.iter().any(|task| task.id == *id));
         admission
             .queue
             .retain(|id| tasks.iter().any(|t| t.id == *id && t.enabled));
@@ -218,6 +243,41 @@ impl Daemon {
 
     pub fn tasks_snapshot(&self) -> Vec<TaskConfig> {
         self.tasks.lock().unwrap().clone()
+    }
+
+    pub fn last_run(&self, id: TaskId) -> Option<ExecutionRecord> {
+        self.last_runs.lock().unwrap().get(&id).cloned()
+    }
+
+    pub fn next_fire(&self, id: TaskId) -> Option<jiff::civil::DateTime> {
+        let tasks = self.tasks.lock().unwrap();
+        let task = tasks.iter().find(|task| task.id == id)?;
+        self.tracker
+            .lock()
+            .unwrap()
+            .next_fire(task, &local_now(jiff::Timestamp::now()))
+    }
+
+    pub fn queue_reason(&self, id: TaskId) -> Option<String> {
+        let admission = self.admission.lock().unwrap();
+        if !admission.queue.contains(&id) {
+            return None;
+        }
+        if admission.active.contains_key(&id) {
+            return Some("等待当前执行结束".into());
+        }
+        if admission.active.len() >= admission.max_parallel {
+            return Some("等待空闲执行名额".into());
+        }
+        let tasks = self.tasks.lock().unwrap();
+        if let Some(TaskConfig {
+            concurrency: ConcurrencyPolicy::Group(group),
+            ..
+        }) = tasks.iter().find(|task| task.id == id)
+        {
+            return Some(format!("等待互斥组“{group}”"));
+        }
+        Some("等待接续执行".into())
     }
 
     pub fn execute_now(&self, id: TaskId) {
@@ -355,6 +415,8 @@ impl Daemon {
         admission.active.insert(
             task.id,
             ActiveRun {
+                started_at: jiff::Timestamp::now(),
+                started: Instant::now(),
                 policy: task.concurrency.clone(),
                 cancel: Arc::new(AtomicBool::new(false)),
             },
@@ -494,7 +556,7 @@ impl Daemon {
         retry_triggered: bool,
         admission: &mut AdmissionState,
     ) {
-        admission.active.remove(&id);
+        let active = admission.active.remove(&id);
         let current = self
             .tasks
             .lock()
@@ -503,6 +565,19 @@ impl Daemon {
             .find(|t| t.id == id)
             .cloned();
         if let Some(task) = current {
+            if let Some(active) = active {
+                self.last_runs.lock().unwrap().insert(
+                    id,
+                    ExecutionRecord {
+                        started_at: active.started_at,
+                        finished_at: jiff::Timestamp::now(),
+                        duration: active.started.elapsed(),
+                        returncode,
+                        stopped: active.cancel.load(Ordering::SeqCst),
+                        retry_triggered,
+                    },
+                );
+            }
             self.states.finalize_status(id, task.enabled, "执行结束");
             if admission.queue.contains(&id) {
                 self.change_status(id, TaskStatus::Queued, "等待下一次执行");

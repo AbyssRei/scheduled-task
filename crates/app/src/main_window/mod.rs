@@ -34,9 +34,12 @@ impl TaskListView {
         cx.subscribe_in(
             &table,
             window,
-            |this, _state, event: &TableEvent, _window, _cx| {
+            |this, _state, event: &TableEvent, _window, cx| {
                 if let TableEvent::SelectRow(ix) = event {
-                    this.selected = this.table.read(_cx).delegate().rows.get(*ix).map(|r| r.id);
+                    this.selected = this.table.read(cx).delegate().rows.get(*ix).map(|r| r.id);
+                    this.log_panel
+                        .update(cx, |panel, cx| panel.set_selected(this.selected, cx));
+                    cx.notify();
                 }
             },
         )
@@ -51,6 +54,14 @@ impl TaskListView {
 
     fn refresh_rows(&mut self, cx: &mut Context<Self>) {
         let rows = build_rows(&self.core);
+        if self
+            .selected
+            .is_some_and(|id| !rows.iter().any(|row| row.id == id))
+        {
+            self.selected = None;
+            self.log_panel
+                .update(cx, |panel, cx| panel.set_selected(None, cx));
+        }
         self.table.update(cx, |state, cx| {
             *state.delegate_mut() = TaskRows { rows };
             state.refresh(cx);
@@ -70,39 +81,41 @@ impl TaskListView {
                 // 日志时区配置变更后,缓冲中的时间戳也使用新时区重新显示。
                 self.log_panel.update(cx, |_, cx| cx.notify());
             }
-            DaemonEvent::Status { id, status } => {
-                self.table.update(cx, |state, _| {
-                    if let Some(row) = state.delegate_mut().rows.iter_mut().find(|r| r.id == id) {
-                        row.status = status;
-                    }
-                });
-                cx.notify();
-            }
+            DaemonEvent::Status { .. } => self.refresh_rows(cx),
             DaemonEvent::LogLine { id, line } => {
-                self.append_log(format!("[{id}] {line}"), cx);
+                self.append_task_log(id, format!("[{id}] {line}"), cx);
             }
             DaemonEvent::Finished {
                 id,
                 returncode,
                 retry_triggered,
             } => {
-                self.append_log(
+                self.refresh_rows(cx);
+                self.append_task_log(
+                    id,
                     format!("[{id}] 执行结束(返回码 {returncode},重试触发 {retry_triggered})"),
                     cx,
                 );
             }
             DaemonEvent::AdmittedRejected { id, reason } => {
-                self.append_log(format!("[{id}] 触发被拒: {reason}"), cx);
+                self.refresh_rows(cx);
+                self.append_task_log(id, format!("[{id}] 触发被拒: {reason}"), cx);
             }
             DaemonEvent::Queued { id } => {
-                self.append_log(format!("[{id}] 已进入并发等待队列"), cx);
+                self.refresh_rows(cx);
+                self.append_task_log(id, format!("[{id}] 已进入并发等待队列"), cx);
             }
         }
     }
 
     fn append_log(&mut self, line: String, cx: &mut Context<Self>) {
         self.log_panel
-            .update(cx, |panel, cx| panel.push_log(line, cx));
+            .update(cx, |panel, cx| panel.push_log(None, line, cx));
+    }
+
+    fn append_task_log(&mut self, id: TaskId, line: String, cx: &mut Context<Self>) {
+        self.log_panel
+            .update(cx, |panel, cx| panel.push_log(Some(id), line, cx));
     }
 }
 
@@ -142,6 +155,19 @@ impl Render for TaskListView {
             .p_4()
             .gap_3()
             .child(self.render_toolbar(cx))
+            .children(
+                self.selected
+                    .and_then(|id| self.core.last_run(id))
+                    .map(|record| {
+                        div().text_size(gpui_kit::px(12.)).child(format!(
+                            "最近执行：{} → {} · {:.2} 秒 · 退出码 {}",
+                            scheduled_task_core::logger::format_log_timestamp(record.started_at),
+                            scheduled_task_core::logger::format_log_timestamp(record.finished_at),
+                            record.duration.as_secs_f64(),
+                            record.returncode
+                        ))
+                    }),
+            )
             .child(div().flex_1().min_h_0().child(DataTable::new(&self.table)))
             .child(self.log_panel.clone())
     }
