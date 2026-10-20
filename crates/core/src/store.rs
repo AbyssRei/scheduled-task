@@ -199,6 +199,8 @@ fn validate_config(config: &ConfigFile) -> Result<(), StoreError> {
     }
     let mut ids = std::collections::HashSet::new();
     for task in &config.tasks {
+        task.validate()
+            .map_err(|message| StoreError::InvalidConfig(format!("任务 {}: {message}", task.id)))?;
         if !ids.insert(task.id) {
             return Err(StoreError::InvalidConfig(format!(
                 "任务 ID 重复: {}",
@@ -223,6 +225,55 @@ mod tests {
 
     use super::*;
     use crate::model::{PyLauncher, Schedule, ScriptKind, ScriptSource, ScriptSpec};
+
+    #[test]
+    fn 手工配置与保存共享任务边界且极端超时不触发异常() {
+        let store = temporary_store();
+        let source = r#"(config_version: 2, tasks: [(
+            id: (1), name: "边界验证", script: (kind: cmd, source: inline("exit /b 0")),
+            schedule: monthly(day: (1), times: ["08:00:00"]),
+            retry: Some((window: 1, max_retries: 1)), timeout: Some(1)
+        )])"#;
+        for invalid in [
+            source.replace("day: (1)", "day: (0)"),
+            source.replace("day: (1)", "day: (32)"),
+            source.replace("[\"08:00:00\"]", "[]"),
+            source.replace("window: 1", "window: 0"),
+            source.replace("window: 1", "window: 101"),
+            source.replace("max_retries: 1", "max_retries: 0"),
+            source.replace("max_retries: 1", "max_retries: 11"),
+            source.replace("Some(1)", "Some(0)"),
+            source.replace("Some(1)", "Some(301)"),
+            source.replace("Some(1)", "Some(18446744073709551615)"),
+            source.replace("边界验证", " "),
+        ] {
+            std::fs::write(store.path(), &invalid).unwrap();
+            assert!(store.load().is_err(), "不应加载：{invalid}");
+            if let Ok(config) = ron::from_str::<ConfigFile>(&invalid) {
+                assert!(store.save(&config).is_err(), "不应保存：{invalid}");
+            }
+        }
+        for valid in [
+            source.to_string(),
+            source
+                .replace("Some(1)", "Some(300)")
+                .replace("window: 1", "window: 100")
+                .replace("max_retries: 1", "max_retries: 10"),
+        ] {
+            std::fs::write(store.path(), valid).unwrap();
+            let config = store.load().unwrap();
+            store.save(&config).unwrap();
+            assert_eq!(
+                store.load().unwrap().tasks[0]
+                    .schedule
+                    .monthly_day()
+                    .unwrap()
+                    .get(),
+                1
+            );
+        }
+        std::fs::remove_file(store.path()).unwrap();
+    }
 
     #[test]
     fn ron_roundtrip_preserves_enum_shapes() {

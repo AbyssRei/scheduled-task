@@ -44,6 +44,51 @@ pub struct TaskConfig {
     pub concurrency: ConcurrencyPolicy,
 }
 
+impl TaskConfig {
+    /// 所有配置入口共享的领域约束，避免手工编辑绕过表单校验。
+    pub fn validate(&self) -> Result<(), String> {
+        if self.name.trim().is_empty() {
+            return Err("任务名称不能为空".into());
+        }
+        if self.schedule.times().is_empty() {
+            return Err("至少需要一个触发时间(HH:MM:SS)".into());
+        }
+        match &self.script.source {
+            ScriptSource::File(path) if path.trim().is_empty() => {
+                return Err("脚本路径不能为空".into());
+            }
+            _ => {}
+        }
+        if let ScriptKind::Manual { command } = &self.script.kind
+            && command.trim().is_empty()
+        {
+            return Err("手工命令不能为空".into());
+        }
+        if let Some(retry) = &self.retry {
+            if !(1..=100).contains(&retry.window) {
+                return Err("连续次数 应在 1–100 之间".into());
+            }
+            if !(1..=10).contains(&retry.max_retries) {
+                return Err("最大重试次数 应在 1–10 之间".into());
+            }
+        }
+        if self.timeout.is_some_and(|value| {
+            value < Duration::from_secs(60)
+                || value > Duration::from_secs(300 * 60)
+                || value.as_secs() % 60 != 0
+                || value.subsec_nanos() != 0
+        }) {
+            return Err("超时应为 1–300 的整数分钟".into());
+        }
+        if let ConcurrencyPolicy::Group(group) = &self.concurrency
+            && group.trim().is_empty()
+        {
+            return Err("同组互斥需要填写组名".into());
+        }
+        Ok(())
+    }
+}
+
 fn default_true() -> bool {
     true
 }
@@ -77,7 +122,13 @@ mod timeout_secs_opt {
 
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Duration>, D::Error> {
         let minutes: Option<u64> = Option::deserialize(d)?;
-        Ok(minutes.map(|m| Duration::from_secs(m * 60)))
+        minutes
+            .map(|m| {
+                m.checked_mul(60)
+                    .map(Duration::from_secs)
+                    .ok_or_else(|| serde::de::Error::custom("超时分钟数溢出"))
+            })
+            .transpose()
     }
 }
 
@@ -112,8 +163,17 @@ impl Schedule {
 }
 
 /// 每月几号(1–31),加载时校验。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct DayOfMonth(u8);
+
+impl<'de> Deserialize<'de> for DayOfMonth {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(rename = "DayOfMonth")]
+        struct RawDay(u8);
+        Self::new(RawDay::deserialize(deserializer)?.0).map_err(serde::de::Error::custom)
+    }
+}
 
 impl DayOfMonth {
     pub fn new(day: u8) -> Result<Self, ModelError> {

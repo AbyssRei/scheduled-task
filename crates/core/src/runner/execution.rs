@@ -16,6 +16,13 @@ use super::{RunOptions, RunOutcome, RunnerError, RunningProcess, global_registry
 
 /// 执行脚本并实时回报输出(阻塞直到进程结束/重试触发/超时)。
 pub fn run(spec: &ScriptSpec, opts: RunOptions) -> Result<RunOutcome, RunnerError> {
+    if opts
+        .retry
+        .as_ref()
+        .is_some_and(|retry| retry.window == 0 || retry.window > 100)
+    {
+        return Err(RunnerError::Resolve("连续次数 应在 1–100 之间".into()));
+    }
     let resolved = resolve(spec)?;
     if opts
         .cancel

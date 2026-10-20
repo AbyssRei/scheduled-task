@@ -44,6 +44,7 @@ impl AppSettings {
 
 /// 应用共享核心:配置权威副本 + daemon + 持久化。
 pub struct AppCore {
+    change_gate: Mutex<()>,
     daemon: Arc<Daemon>,
     store: TaskStore,
     tasks: Mutex<Vec<TaskConfig>>,
@@ -75,7 +76,7 @@ impl AppCore {
         let mut next = 1_u64;
         for t in &mut tasks {
             if t.id.0 >= next {
-                next = t.id.0 + 1;
+                next = t.id.0.checked_add(1).ok_or("任务 ID 已耗尽")?;
             }
         }
         let theme = config.theme.unwrap_or_default();
@@ -87,6 +88,7 @@ impl AppCore {
             tasks.len()
         );
         Ok(Arc::new(Self {
+            change_gate: Mutex::new(()),
             daemon,
             store,
             tasks: Mutex::new(tasks),
@@ -108,37 +110,47 @@ impl AppCore {
         self.daemon.states().get_status(id)
     }
 
-    pub fn add(&self, mut task: TaskConfig) -> TaskId {
-        task.id = TaskId(self.next_id.fetch_add(1, Ordering::SeqCst));
-        self.tasks.lock().unwrap().push(task.clone());
-        self.commit_task_changes();
-        task.id
+    pub fn add(&self, mut task: TaskConfig) -> Result<TaskId, String> {
+        task.id = TaskId(
+            self.next_id
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |id| id.checked_add(1))
+                .map_err(|_| "任务 ID 已耗尽")?,
+        );
+        let id = task.id;
+        self.commit_task_changes(|tasks| {
+            tasks.push(task);
+            Ok(())
+        })?;
+        Ok(id)
     }
 
     /// 编辑任务:运行族状态保留(daemon.reload_preserving 语义)。
-    pub fn update(&self, task: TaskConfig) {
-        let mut all = self.tasks.lock().unwrap();
-        if let Some(slot) = all.iter_mut().find(|t| t.id == task.id) {
+    pub fn update(&self, task: TaskConfig) -> Result<(), String> {
+        self.commit_task_changes(|tasks| {
+            let slot = tasks
+                .iter_mut()
+                .find(|t| t.id == task.id)
+                .ok_or("任务不存在")?;
             *slot = task;
-        }
-        drop(all);
-        self.commit_task_changes();
+            Ok(())
+        })
     }
 
-    pub fn delete(&self, id: TaskId) {
-        self.tasks.lock().unwrap().retain(|t| t.id != id);
-        self.commit_task_changes();
+    pub fn delete(&self, id: TaskId) -> Result<(), String> {
+        self.commit_task_changes(|tasks| {
+            tasks.retain(|t| t.id != id);
+            Ok(())
+        })
     }
 
     /// 启用/禁用切换。运行族任务仅翻转 enabled 标记,运行状态保留
     /// (收尾时由 finalize_status 按 enabled 归一化)。
-    pub fn toggle_enabled(&self, id: TaskId) {
-        let mut all = self.tasks.lock().unwrap();
-        if let Some(t) = all.iter_mut().find(|t| t.id == id) {
-            t.enabled = !t.enabled;
-        }
-        drop(all);
-        self.commit_task_changes();
+    pub fn toggle_enabled(&self, id: TaskId) -> Result<(), String> {
+        self.commit_task_changes(|tasks| {
+            let task = tasks.iter_mut().find(|t| t.id == id).ok_or("任务不存在")?;
+            task.enabled = !task.enabled;
+            Ok(())
+        })
     }
 
     pub fn run_now(&self, id: TaskId) {
@@ -206,6 +218,7 @@ impl AppCore {
     where
         F: FnOnce() -> Result<(), String>,
     {
+        let _guard = self.change_gate.lock().unwrap();
         settings.validate()?;
         let previous_settings = self.settings();
         if settings == previous_settings {
@@ -237,11 +250,21 @@ impl AppCore {
         Ok(())
     }
 
-    /// 任务配置变更的统一收尾:保留运行状态重载、持久化并通知界面。
-    fn commit_task_changes(&self) {
-        self.daemon.reload_preserving(self.tasks());
-        self.save();
+    /// 候选配置先完整保存，成功后再发布给界面及调度器。
+    fn commit_task_changes(
+        &self,
+        change: impl FnOnce(&mut Vec<TaskConfig>) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let _guard = self.change_gate.lock().unwrap();
+        let mut config = self.config_snapshot();
+        change(&mut config.tasks)?;
+        self.store
+            .save(&config)
+            .map_err(|error| format!("保存任务失败，更改未应用：{error}"))?;
+        *self.tasks.lock().unwrap() = config.tasks.clone();
+        self.daemon.reload_preserving(config.tasks);
         self.daemon.notify_config_changed();
+        Ok(())
     }
     fn config_snapshot(&self) -> ConfigFile {
         let tasks = self.tasks.lock().unwrap().clone();
@@ -253,12 +276,6 @@ impl AppCore {
             log_level: self.log_level(),
             log_retention: self.log_retention(),
             log_timezone: self.log_timezone(),
-        }
-    }
-
-    fn save(&self) {
-        if let Err(e) = self.store.save(&self.config_snapshot()) {
-            tracing::error!("保存任务配置失败: {e}");
         }
     }
 }
@@ -299,6 +316,7 @@ mod tests {
             ));
             let (tx, _) = std::sync::mpsc::channel();
             let core = AppCore {
+                change_gate: Mutex::new(()),
                 daemon: Arc::new(Daemon::new(tx)),
                 store: TaskStore::new(directory.join("tasks.ron")),
                 tasks: Mutex::new(vec![TaskConfig {
@@ -312,7 +330,9 @@ mod tests {
                         env: Default::default(),
                         env_file: None,
                     },
-                    schedule: Schedule::Daily { times: vec![] },
+                    schedule: Schedule::Daily {
+                        times: vec!["23:59:59".parse().unwrap()],
+                    },
                     retry: None,
                     timeout: None,
                     enabled: false,
@@ -326,6 +346,7 @@ mod tests {
                 log_timezone: Mutex::new(LogTimeZone::Custom("UTC".into())),
             };
             core.store.save(&core.config_snapshot()).unwrap();
+            core.daemon.load(core.tasks());
             Self(core, directory)
         }
 
@@ -348,6 +369,62 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.1);
         }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn 任务增删改及禁用保存失败均保留文件内存和调度状态() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let test = TestCore::new();
+        let core = &test.0;
+        let original = std::fs::read(core.store.path()).unwrap();
+        // 禁止替换已打开的目标文件，模拟真实的 Windows 保存失败。
+        let handle = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(1)
+            .open(core.store.path())
+            .unwrap();
+        let mut changed = core.tasks()[0].clone();
+        changed.name = "更改后的任务".into();
+        for result in [
+            core.add(changed.clone()).map(|_| ()),
+            core.update(changed.clone()),
+            core.delete(TaskId(42)),
+            core.toggle_enabled(TaskId(42)),
+        ] {
+            assert!(result.is_err());
+            assert_eq!(std::fs::read(core.store.path()).unwrap(), original);
+            assert_eq!(core.tasks().len(), 1);
+            assert_eq!(core.tasks()[0].name, "仅保存，不运行");
+            assert!(!core.tasks()[0].enabled);
+            assert_eq!(core.daemon.tasks_snapshot()[0].name, "仅保存，不运行");
+            assert_eq!(core.status_of(TaskId(42)), Some(TaskStatus::Disabled));
+        }
+        drop(handle);
+        core.update(changed).unwrap();
+        assert_eq!(core.tasks()[0].name, "更改后的任务");
+        assert_eq!(core.daemon.tasks_snapshot()[0].name, "更改后的任务");
+        assert_eq!(core.store.load().unwrap().tasks[0].name, "更改后的任务");
+    }
+
+    #[test]
+    fn 并发提交任务和设置不覆盖彼此且无效任务不发布() {
+        let test = TestCore::new();
+        let core = &test.0;
+        let mut invalid = core.tasks()[0].clone();
+        invalid.name.clear();
+        assert!(core.update(invalid).is_err());
+        std::thread::scope(|scope| {
+            scope.spawn(|| core.toggle_enabled(TaskId(42)).unwrap());
+            scope.spawn(|| {
+                core.save_settings_with(test.changed(), |_, _| Ok(|| Ok(())))
+                    .unwrap()
+            });
+        });
+        let saved = core.store.load().unwrap();
+        assert!(saved.tasks[0].enabled);
+        assert_eq!(saved.max_parallel, test.changed().max_parallel);
+        assert_eq!(core.tasks()[0].enabled, saved.tasks[0].enabled);
     }
 
     #[test]

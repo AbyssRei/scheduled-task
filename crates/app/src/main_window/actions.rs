@@ -10,6 +10,15 @@ use scheduled_task_core::state::{TaskStatus, is_running_family};
 use super::TaskListView;
 use crate::task_dialog::TaskDialogView;
 
+fn show_task_error(message: String, window: &mut gpui_kit::Window, cx: &mut App) {
+    window.open_alert_dialog(cx, move |alert, _, _| {
+        alert
+            .title("保存失败")
+            .child(DialogDescription::new().child(message.clone()))
+            .show_cancel(false)
+    });
+}
+
 fn dismiss_footer() -> DialogFooter {
     DialogFooter::new().child(
         Button::new("btn-dismiss")
@@ -58,9 +67,12 @@ impl TaskListView {
                         .child("删除后配置立即保存,且不可恢复。确认删除该任务?"),
                 )
                 .show_cancel(true)
-                .on_ok(move |_, _, _| {
-                    core.delete(id);
-                    true
+                .on_ok(move |_, window, cx| match core.delete(id) {
+                    Ok(()) => true,
+                    Err(error) => {
+                        show_task_error(error, window, cx);
+                        false
+                    }
                 })
         });
     }
@@ -69,7 +81,9 @@ impl TaskListView {
         let Some(id) = self.require_selected(window, cx) else {
             return;
         };
-        self.core.toggle_enabled(id);
+        if let Err(error) = self.core.toggle_enabled(id) {
+            show_task_error(error, window, cx);
+        }
     }
 
     pub(super) fn run_selected(&mut self, window: &mut gpui_kit::Window, cx: &mut App) {

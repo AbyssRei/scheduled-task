@@ -302,21 +302,21 @@ impl TaskDialogView {
 
     /// 校验并构造 TaskConfig;错误信息为中文,弹 alert 提示。
     fn save(&mut self, window: &mut gpui_kit::Window, cx: &mut App) {
-        match self.collect_config(cx) {
-            Ok(task) => {
-                if self.editing.is_some() {
-                    self.core.update(task);
-                } else {
-                    self.core.add(task);
-                }
-                window.close_dialog(cx);
+        let result = self.collect_config(cx).and_then(|task| {
+            if self.editing.is_some() {
+                self.core.update(task)
+            } else {
+                self.core.add(task).map(|_| ())
             }
+        });
+        match result {
+            Ok(()) => window.close_dialog(cx),
             Err(msg) => {
                 let msg = msg.clone();
                 window.open_alert_dialog(cx, move |alert, _, _| {
                     let msg = msg.clone();
                     alert
-                        .title("校验失败")
+                        .title("保存失败")
                         .child(DialogDescription::new().child(msg))
                         .show_cancel(false)
                 });

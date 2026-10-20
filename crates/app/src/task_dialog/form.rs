@@ -194,7 +194,7 @@ impl FormValues {
             _ => return Err("请选择有效的并发策略".into()),
         };
 
-        Ok(TaskConfig {
+        let task = TaskConfig {
             id,
             name: name.trim().to_string(),
             script: ScriptSpec {
@@ -210,7 +210,9 @@ impl FormValues {
             timeout,
             enabled: self.enabled,
             concurrency,
-        })
+        };
+        task.validate()?;
+        Ok(task)
     }
 }
 
