@@ -215,7 +215,11 @@ pub fn init_logging_with_settings(
     std::fs::create_dir_all(log_dir)?;
 
     let file_appender = daily::SharedLogWriter::new(log_dir, retention, timezone.clone())?;
-    let (file_writer, guard) = tracing_appender::non_blocking(file_appender.clone());
+    // 文件队列有界并施加背压，界面丢弃展示日志时仍保留文件记录。
+    let (file_writer, guard) = tracing_appender::non_blocking::NonBlockingBuilder::default()
+        .buffered_lines_limit(1024)
+        .lossy(false)
+        .finish(file_appender.clone());
 
     let (file_filter, handle) = reload::Layer::new(LogLevel::default().filter());
     let file_layer = tracing_subscriber::fmt::layer()

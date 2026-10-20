@@ -187,3 +187,64 @@ fn argument_probe() {
     assert_eq!(arguments, expected);
     println!("ARGUMENT_PROBE_OK");
 }
+
+#[test]
+fn 大输出保持逐段回调且捕获内存有界() {
+    use scheduled_task_core::runner::{Charset, OutputCapture};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    let bytes = Arc::new(AtomicUsize::new(0));
+    let captured = bytes.clone();
+    let result = run(&ScriptSpec {
+        kind: ScriptKind::Pwsh,
+        source: ScriptSource::Inline("[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false); [Console]::Out.Write(('字' * 700000))".into()),
+        args: vec![], working_dir: None, env: Default::default(), env_file: None,
+    }, RunOptions {
+        capture: OutputCapture::Tail(8192), charset: Charset::Utf8,
+        timeout: Some(Duration::from_secs(15)),
+        on_line: Some(Box::new(move |line| {
+            assert!(line.len() <= 64 * 1024);
+            assert!(line.chars().all(|character| character == '字'));
+            captured.fetch_add(line.len(), Ordering::SeqCst);
+        })), ..Default::default()
+    }).unwrap();
+    assert_eq!(result.returncode, 0);
+    assert_eq!(bytes.load(Ordering::SeqCst), 700000 * 3);
+    assert!(result.output.len() <= 8192);
+    assert!(result.output_truncated);
+}
+
+#[test]
+fn 输出管道积压时取消仍能结束读取线程() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    let cancel = Arc::new(AtomicBool::new(false));
+    let callback_cancel = cancel.clone();
+    let result = run(
+        &ScriptSpec {
+            kind: ScriptKind::Cmd,
+            source: ScriptSource::Inline(
+                "@echo off\r\nfor /L %%i in (1,1,100000) do echo %%i\r\n".into(),
+            ),
+            args: vec![],
+            working_dir: None,
+            env: Default::default(),
+            env_file: None,
+        },
+        RunOptions {
+            cancel: Some(cancel),
+            timeout: Some(Duration::from_secs(5)),
+            on_line: Some(Box::new(move |_| {
+                std::thread::sleep(Duration::from_millis(100));
+                callback_cancel.store(true, Ordering::SeqCst);
+            })),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_ne!(result.returncode, 0);
+}

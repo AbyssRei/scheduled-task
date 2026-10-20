@@ -2,7 +2,7 @@
 //!
 //! 验证调度编排与进程执行的端到端行为,bat 场景仅在 Windows 跑。
 
-use std::sync::mpsc::Receiver;
+use scheduled_task_core::daemon::EventReceiver as Receiver;
 use std::time::Duration;
 
 use scheduled_task_core::daemon::{DaemonEvent, execute_with_retry, spawn_channel};
@@ -44,7 +44,7 @@ fn base_task(id: u64, name: &str, script: ScriptSpec) -> TaskConfig {
     }
 }
 
-fn drain(rx: &Receiver<DaemonEvent>) -> Vec<DaemonEvent> {
+fn drain(rx: &Receiver) -> Vec<DaemonEvent> {
     let mut events = Vec::new();
     while let Ok(e) = rx.try_recv() {
         events.push(e);

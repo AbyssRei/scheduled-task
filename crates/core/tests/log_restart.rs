@@ -12,7 +12,7 @@ use scheduled_task_core::logger::{
 const LOG_DIR_ENV: &str = "SCHEDULED_TASK_LOG_RESTART_TEST_DIR";
 const BATCH_ENV: &str = "SCHEDULED_TASK_LOG_RESTART_TEST_BATCH";
 const SCENARIO_ENV: &str = "SCHEDULED_TASK_LOG_SETTINGS_TEST_SCENARIO";
-const RECORDS_PER_BATCH: usize = 1000;
+const RECORDS_PER_BATCH: usize = 4000;
 
 struct TempLogDir(PathBuf);
 

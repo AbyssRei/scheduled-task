@@ -60,7 +60,7 @@ fn main() {
         return;
     }
 
-    let (event_tx, event_rx) = std::sync::mpsc::channel::<DaemonEvent>();
+    let (event_tx, event_rx) = scheduled_task_core::daemon::spawn_channel();
     let daemon = Arc::new(Daemon::new(event_tx));
     // 核心先读取配置,再按持久化的存储限制初始化 CWD logs/。
     let core = match AppCore::init(daemon.clone()) {
@@ -77,7 +77,7 @@ fn main() {
     }
 
     // 事件上行:std mpsc → async-channel
-    let (async_tx, async_rx) = async_channel::unbounded::<DaemonEvent>();
+    let (async_tx, async_rx) = async_channel::bounded::<DaemonEvent>(128);
     spawn_event_forward(event_rx, async_tx);
 
     // daemon 调度线程(1s tick)
@@ -156,8 +156,17 @@ fn main() {
             // UI 事件循环:async-channel → 视图更新
             cx.spawn(async move |cx| {
                 while let Ok(event) = async_rx.recv().await {
+                    let mut batch = vec![event];
+                    while batch.len() < 128 {
+                        match async_rx.try_recv() {
+                            Ok(event) => batch.push(event),
+                            Err(_) => break,
+                        }
+                    }
                     cx.update(|cx| {
-                        main_window::apply_event_to_view(cx, event);
+                        for event in batch {
+                            main_window::apply_event_to_view(cx, event);
+                        }
                     });
                 }
             })

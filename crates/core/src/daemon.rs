@@ -6,6 +6,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+mod events;
+pub use events::{EventReceiver, EventSender};
+
 use crate::model::{ConcurrencyPolicy, TaskConfig, TaskId};
 use crate::retry::check_retry_condition;
 use crate::runner::{ProcessRegistry, RetryCheck, RunOptions};
@@ -14,6 +17,9 @@ use crate::state::{StateError, TaskStateManager, TaskStatus, is_running_family};
 
 #[derive(Debug, Clone)]
 pub enum DaemonEvent {
+    LogsDropped {
+        count: u64,
+    },
     Status {
         id: TaskId,
         status: TaskStatus,
@@ -64,7 +70,7 @@ pub struct Daemon {
     states: Arc<TaskStateManager>,
     tasks: Arc<Mutex<Vec<TaskConfig>>>,
     tracker: Arc<Mutex<FireTracker>>,
-    event_tx: std::sync::mpsc::Sender<DaemonEvent>,
+    event_tx: EventSender,
     shutdown: Arc<AtomicBool>,
     dead_since: Arc<Mutex<HashMap<TaskId, Instant>>>,
     tick_count: Arc<AtomicU64>,
@@ -72,15 +78,12 @@ pub struct Daemon {
     admission: Arc<Mutex<AdmissionState>>,
 }
 
-pub fn spawn_channel() -> (
-    std::sync::mpsc::Sender<DaemonEvent>,
-    std::sync::mpsc::Receiver<DaemonEvent>,
-) {
-    std::sync::mpsc::channel()
+pub fn spawn_channel() -> (EventSender, EventReceiver) {
+    events::channel()
 }
 
 impl Daemon {
-    pub fn new(event_tx: std::sync::mpsc::Sender<DaemonEvent>) -> Self {
+    pub fn new(event_tx: EventSender) -> Self {
         Self {
             states: Arc::new(TaskStateManager::new()),
             tasks: Arc::new(Mutex::new(Vec::new())),
@@ -98,10 +101,7 @@ impl Daemon {
         }
     }
 
-    pub fn with_max_parallel(
-        event_tx: std::sync::mpsc::Sender<DaemonEvent>,
-        max_parallel: usize,
-    ) -> Self {
+    pub fn with_max_parallel(event_tx: EventSender, max_parallel: usize) -> Self {
         let daemon = Self::new(event_tx);
         daemon.set_max_parallel(max_parallel);
         daemon
@@ -521,11 +521,7 @@ impl Daemon {
 }
 
 /// 独立执行入口,供无调度器的验证场景使用。
-pub fn execute_with_retry(
-    task: &TaskConfig,
-    states: &TaskStateManager,
-    event_tx: &std::sync::mpsc::Sender<DaemonEvent>,
-) {
+pub fn execute_with_retry(task: &TaskConfig, states: &TaskStateManager, event_tx: &EventSender) {
     if states
         .transition(task.id, TaskStatus::Running, "开始执行")
         .is_err()
@@ -557,7 +553,7 @@ pub fn execute_with_retry(
 fn execute_attempts(
     task: &TaskConfig,
     states: &TaskStateManager,
-    event_tx: &std::sync::mpsc::Sender<DaemonEvent>,
+    event_tx: &EventSender,
     cancel: Option<Arc<AtomicBool>>,
     admission: Option<&Mutex<AdmissionState>>,
 ) -> (i32, bool) {
@@ -602,6 +598,7 @@ fn execute_attempts(
         let result = crate::runner::run(
             &task.script,
             RunOptions {
+                capture: Default::default(),
                 id: Some(task.id),
                 timeout: task.timeout,
                 cancel: cancel.clone(),

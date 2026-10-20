@@ -44,6 +44,8 @@ pub type RetryCheckFn = Box<dyn Fn(&str, &[String]) -> bool + Send>;
 
 /// 运行期选项。
 pub struct RunOptions {
+    /// 默认只累计最近 256 KiB；逐行回调始终接收全部输出。
+    pub capture: OutputCapture,
     /// 托管执行的取消令牌,覆盖创建进程之前及注册间隙。
     pub cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// 注册键(TaskId),None 表示不登记(不可被外部 stop)
@@ -66,6 +68,7 @@ pub struct RetryCheck {
 impl Default for RunOptions {
     fn default() -> Self {
         Self {
+            capture: OutputCapture::default(),
             cancel: None,
             id: None,
             timeout: None,
@@ -76,11 +79,25 @@ impl Default for RunOptions {
     }
 }
 
-/// 执行结果:退出码、完整输出与重试触发标记。
+/// 结果捕获策略；完整捕获只用于明确接受内存成本的独立调用。
+#[derive(Debug, Clone, Copy)]
+pub enum OutputCapture {
+    Tail(usize),
+    Full,
+}
+
+impl Default for OutputCapture {
+    fn default() -> Self {
+        Self::Tail(256 * 1024)
+    }
+}
+
+/// 执行结果:退出码、捕获输出及截断与重试标记。
 #[derive(Debug, Clone)]
 pub struct RunOutcome {
     pub returncode: i32,
     pub output: String,
+    pub output_truncated: bool,
     pub retry_triggered: bool,
 }
 

@@ -1,5 +1,6 @@
 //! 执行生命周期：启动、输出回调、重试判定、超时停止和收尾。
 
+use std::collections::VecDeque;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
@@ -12,7 +13,56 @@ use super::command::resolve;
 #[cfg(windows)]
 use super::job;
 use super::output;
-use super::{RunOptions, RunOutcome, RunnerError, RunningProcess, global_registry};
+use super::{OutputCapture, RunOptions, RunOutcome, RunnerError, RunningProcess, global_registry};
+
+struct OutputBuffer {
+    lines: VecDeque<String>,
+    bytes: usize,
+    limit: usize,
+    truncated: bool,
+}
+
+impl OutputBuffer {
+    fn new(capture: OutputCapture) -> Self {
+        Self {
+            lines: VecDeque::new(),
+            bytes: 0,
+            limit: match capture {
+                OutputCapture::Tail(limit) => limit,
+                OutputCapture::Full => usize::MAX,
+            },
+            truncated: false,
+        }
+    }
+    fn push(&mut self, mut line: String) {
+        if line.len() > self.limit {
+            let mut start = line.len() - self.limit;
+            while !line.is_char_boundary(start) {
+                start += 1;
+            }
+            line = line[start..].to_owned();
+            self.truncated = true;
+        }
+        let size = line.len().saturating_add(1);
+        while self.bytes.saturating_add(size) > self.limit && !self.lines.is_empty() {
+            self.bytes -= self.lines.pop_front().unwrap().len() + 1;
+            self.truncated = true;
+        }
+        if self.limit == 0 {
+            self.truncated = true;
+            return;
+        }
+        self.bytes += size;
+        self.lines.push_back(line);
+    }
+    fn text(&self) -> String {
+        self.lines
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
 
 /// 执行脚本并实时回报输出(阻塞直到进程结束/重试触发/超时)。
 pub fn run(spec: &ScriptSpec, opts: RunOptions) -> Result<RunOutcome, RunnerError> {
@@ -32,6 +82,7 @@ pub fn run(spec: &ScriptSpec, opts: RunOptions) -> Result<RunOutcome, RunnerErro
         return Ok(RunOutcome {
             returncode: -1,
             output: String::new(),
+            output_truncated: false,
             retry_triggered: false,
         });
     }
@@ -98,7 +149,7 @@ fn drive_until_done(
     opts: &RunOptions,
     line_rx: Receiver<String>,
 ) -> RunOutcome {
-    let mut output_lines: Vec<String> = Vec::new();
+    let mut output_lines = OutputBuffer::new(opts.capture);
     let mut output_history: Vec<String> = Vec::new();
     let mut retry_triggered = false;
     let start = Instant::now();
@@ -152,13 +203,14 @@ fn drive_until_done(
     }
 
     let returncode = returncode_of(running);
-    let output = output_lines.join("\n");
+    let output = output_lines.text();
     if returncode != 0 && !retry_triggered {
         tracing::error!("任务执行失败,返回码: {returncode}, 输出: {output}");
     }
     RunOutcome {
         returncode,
         output,
+        output_truncated: output_lines.truncated,
         retry_triggered,
     }
 }
@@ -168,7 +220,7 @@ fn handle_line(
     line: &str,
     running: &Arc<RunningProcess>,
     opts: &RunOptions,
-    output_lines: &mut Vec<String>,
+    output_lines: &mut OutputBuffer,
     output_history: &mut Vec<String>,
     retry_triggered: &mut bool,
 ) {

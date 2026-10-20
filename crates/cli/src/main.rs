@@ -97,7 +97,7 @@ fn run(config_path: &str, only_task: Option<&str>) {
 }
 
 /// 每轮处理有界事件批次,持续输出不能阻塞下一次调度 tick。
-fn drain_events(rx: &std::sync::mpsc::Receiver<DaemonEvent>) {
+fn drain_events(rx: &scheduled_task_core::daemon::EventReceiver) {
     for event in rx.try_iter().take(1000) {
         print_event(event);
     }
@@ -105,6 +105,9 @@ fn drain_events(rx: &std::sync::mpsc::Receiver<DaemonEvent>) {
 
 fn print_event(event: DaemonEvent) {
     match event {
+        DaemonEvent::LogsDropped { count } => {
+            println!("[事件] 输出过快，省略 {count} 条界面日志，完整记录请查看日志文件")
+        }
         DaemonEvent::Status { id, status } => {
             println!("[事件] {id} 状态 -> {}", status.label());
         }

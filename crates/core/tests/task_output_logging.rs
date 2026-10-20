@@ -1,8 +1,8 @@
 //! 真实脚本输出同时进入文件日志和界面事件，且遵守日志等级。
 #![cfg(windows)]
 
+use scheduled_task_core::daemon::EventSender as Sender;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::Sender;
 use std::time::Duration;
 
 use scheduled_task_core::daemon::{DaemonEvent, execute_with_retry, spawn_channel};
@@ -69,7 +69,7 @@ fn task(id: u64, kind: ScriptKind, script: String) -> TaskConfig {
     }
 }
 
-fn run_logged(task: &TaskConfig, path: &Path, level: tracing::Level, tx: &Sender<DaemonEvent>) {
+fn run_logged(task: &TaskConfig, path: &Path, level: tracing::Level, tx: &Sender) {
     let file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
     let subscriber = tracing_subscriber::fmt()
         .with_ansi(false)
@@ -83,6 +83,30 @@ fn run_logged(task: &TaskConfig, path: &Path, level: tracing::Level, tx: &Sender
         execute_with_retry(task, &states, tx);
         assert_eq!(states.get_status(task.id), Some(TaskStatus::Ready));
     });
+}
+
+#[test]
+fn 慢界面省略输出仍完整记录文件并保留完成事件() {
+    let log = LogFile::new(7199);
+    let task = task(
+        7199,
+        ScriptKind::Cmd,
+        "@echo off\r\nfor /L %%i in (1,1,5000) do echo flood-%%i\r\n".into(),
+    );
+    let (tx, rx) = spawn_channel();
+    run_logged(&task, &log.path(), tracing::Level::INFO, &tx);
+    assert_eq!(log.lines().len(), 5000);
+    let events: Vec<_> = rx.try_iter().collect();
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, DaemonEvent::LogsDropped { count } if *count > 0))
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, DaemonEvent::Finished { returncode: 0, .. }))
+    );
 }
 
 #[test]

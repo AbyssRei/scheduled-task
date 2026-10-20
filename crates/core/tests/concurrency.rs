@@ -101,8 +101,8 @@ fn editing_active_policy_preserves_group_queue_order() {
 mod lifecycle {
     use super::*;
     use scheduled_task_core::daemon::DaemonEvent;
+    use scheduled_task_core::daemon::EventReceiver as Receiver;
     use scheduled_task_core::state::TaskStatus;
-    use std::sync::mpsc::Receiver;
     use std::time::{Duration, Instant};
 
     fn executable(id: u64) -> TaskConfig {
@@ -121,7 +121,7 @@ mod lifecycle {
     }
 
     fn receive_until(
-        rx: &Receiver<DaemonEvent>,
+        rx: &Receiver,
         events: &mut Vec<DaemonEvent>,
         predicate: impl Fn(&DaemonEvent) -> bool,
     ) {
@@ -146,11 +146,7 @@ mod lifecycle {
         matches!(event, DaemonEvent::Finished { id: event_id, .. } if *event_id == id)
     }
 
-    fn wait_for_finishes(
-        rx: &Receiver<DaemonEvent>,
-        events: &mut Vec<DaemonEvent>,
-        ids: &[TaskId],
-    ) {
+    fn wait_for_finishes(rx: &Receiver, events: &mut Vec<DaemonEvent>, ids: &[TaskId]) {
         while !ids
             .iter()
             .all(|id| events.iter().any(|event| finished(event, *id)))

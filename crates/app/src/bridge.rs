@@ -282,7 +282,7 @@ impl AppCore {
 
 /// 事件转发:daemon std mpsc → async-channel(UI 侧 await)。
 pub fn spawn_event_forward(
-    rx: std::sync::mpsc::Receiver<DaemonEvent>,
+    rx: scheduled_task_core::daemon::EventReceiver,
     tx: async_channel::Sender<DaemonEvent>,
 ) {
     std::thread::Builder::new()
@@ -314,7 +314,7 @@ mod tests {
                 std::process::id(),
                 NEXT.fetch_add(1, Ordering::Relaxed)
             ));
-            let (tx, _) = std::sync::mpsc::channel();
+            let (tx, _) = scheduled_task_core::daemon::spawn_channel();
             let core = AppCore {
                 change_gate: Mutex::new(()),
                 daemon: Arc::new(Daemon::new(tx)),

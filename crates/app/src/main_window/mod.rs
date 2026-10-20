@@ -61,6 +61,10 @@ impl TaskListView {
     /// daemon 事件 → 视图更新(UI 线程,由 main 的事件循环驱动)。
     pub fn apply_event(&mut self, event: DaemonEvent, cx: &mut Context<Self>) {
         match event {
+            DaemonEvent::LogsDropped { count } => self.append_log(
+                format!("[应用] 输出过快，界面省略了 {count} 条日志；完整记录请查看日志文件。"),
+                cx,
+            ),
             DaemonEvent::ConfigChanged => {
                 self.refresh_rows(cx);
                 // 日志时区配置变更后,缓冲中的时间戳也使用新时区重新显示。
