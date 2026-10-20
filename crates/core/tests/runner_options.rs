@@ -114,3 +114,76 @@ fn invalid_dotenv_blocks_process_start() {
         RunnerError::Resolve(message) if message.contains(".env") && message.contains("缺少")
     ));
 }
+
+#[test]
+fn cmd_and_manual_commands_preserve_literal_arguments() {
+    let directory = TempDirectory::new();
+    let executable = std::env::current_exe().unwrap();
+    let probe = format!(
+        "\"{}\" --exact argument_probe --ignored --nocapture --",
+        executable.display()
+    );
+    let args = [
+        "带空格的参数",
+        "alpha&echo SHOULD_NOT_EXECUTE",
+        "%COMSPEC%",
+        "!PATH!",
+        "a|b<c>d^e(f)",
+        "",
+        "a\"b",
+        "quoted\"&echo SHOULD_NOT_EXECUTE",
+        "尾部\\",
+    ];
+    for kind in [
+        ScriptKind::Cmd,
+        ScriptKind::Manual {
+            command: probe.clone(),
+        },
+    ] {
+        let mut environment = BTreeMap::new();
+        environment.insert("SCHEDULED_TASK_ARGUMENT_PROBE".into(), "1".into());
+        for (index, value) in args.iter().enumerate() {
+            environment.insert(format!("EXPECTED_ARGUMENT_{index}"), (*value).into());
+        }
+        let result = run(
+            &ScriptSpec {
+                kind: kind.clone(),
+                source: ScriptSource::Inline(format!(
+                    "@echo off\r\n{probe} %*\r\nexit /b %errorlevel%\r\n"
+                )),
+                args: args.iter().map(|value| (*value).into()).collect(),
+                working_dir: Some(directory.path().to_string_lossy().into_owned()),
+                env: environment,
+                env_file: None,
+            },
+            RunOptions {
+                timeout: Some(Duration::from_secs(10)),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(result.returncode, 0, "{kind:?}: {}", result.output);
+        assert!(
+            result.output.contains("ARGUMENT_PROBE_OK"),
+            "{}",
+            result.output
+        );
+    }
+}
+
+#[test]
+#[ignore = "仅作为参数测试的隔离子进程入口"]
+fn argument_probe() {
+    if std::env::var_os("SCHEDULED_TASK_ARGUMENT_PROBE").is_none() {
+        return;
+    }
+    let arguments: Vec<_> = std::env::args()
+        .skip_while(|arg| arg != "--")
+        .skip(1)
+        .collect();
+    let expected: Vec<_> = (0..9)
+        .map(|index| std::env::var(format!("EXPECTED_ARGUMENT_{index}")).unwrap())
+        .collect();
+    assert_eq!(arguments, expected);
+    println!("ARGUMENT_PROBE_OK");
+}

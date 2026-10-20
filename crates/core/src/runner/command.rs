@@ -44,7 +44,11 @@ fn materialize(spec: &ScriptSpec) -> Result<PathBuf, RunnerError> {
             };
             // canonicalize 产生 \\?\ VERBATIM 前缀,cmd 无法识别,剥掉
             let s = abs.to_string_lossy();
-            let s = s.strip_prefix(r"\\?\").unwrap_or(&s);
+            let s = if let Some(unc) = s.strip_prefix(r"\\?\UNC\") {
+                format!(r"\\{unc}")
+            } else {
+                s.strip_prefix(r"\\?\").unwrap_or(&s).to_owned()
+            };
             Ok(normalize_separators(PathBuf::from(s)))
         }
         ScriptSource::Inline(content) => {
@@ -78,11 +82,31 @@ fn normalize_separators(p: PathBuf) -> PathBuf {
 
 /// PATH 探测(避免引入 which 依赖)。
 #[cfg(windows)]
-fn find_in_path(program: &str) -> bool {
+fn find_shell(program: &str) -> Option<PathBuf> {
+    let paths = std::env::var_os("PATH")?;
+    find_shell_in_paths(program, std::env::split_paths(&paths))
+}
+
+#[cfg(windows)]
+fn find_shell_in_paths(program: &str, paths: impl Iterator<Item = PathBuf>) -> Option<PathBuf> {
     let exe = format!("{program}.exe");
-    std::env::var_os("PATH")
-        .map(|paths| std::env::split_paths(&paths).any(|dir| dir.join(&exe).is_file()))
-        .unwrap_or(false)
+    paths.map(|directory| directory.join(&exe)).find(|path| {
+        // 系统 bash.exe 是旧 WSL 启动器，不支持本机脚本的 Windows 路径。
+        let launcher = program == "bash"
+            && std::env::var_os("SystemRoot").is_some_and(|root| {
+                ["System32", "Sysnative", "SysWOW64"]
+                    .iter()
+                    .any(|directory| {
+                        path.to_string_lossy().eq_ignore_ascii_case(
+                            &PathBuf::from(&root)
+                                .join(directory)
+                                .join(&exe)
+                                .to_string_lossy(),
+                        )
+                    })
+            });
+        !launcher && path.is_file()
+    })
 }
 
 /// 解析后的启动命令。
@@ -94,12 +118,12 @@ pub(super) struct ResolvedCommand {
     pub(super) working_dir: Option<PathBuf>,
     pub(super) environment: BTreeMap<String, String>,
     /// 命令持有临时文件直到执行与输出读取全部完成。
-    temp_file: Option<PathBuf>,
+    temp_files: Vec<PathBuf>,
 }
 
 impl Drop for ResolvedCommand {
     fn drop(&mut self) {
-        if let Some(path) = &self.temp_file {
+        for path in &self.temp_files {
             let _ = std::fs::remove_file(path);
         }
     }
@@ -124,18 +148,25 @@ pub(super) fn resolve(spec: &ScriptSpec) -> Result<ResolvedCommand, RunnerError>
         feed_newline_stdin: false,
         working_dir,
         environment: BTreeMap::new(),
-        temp_file: matches!(spec.source, ScriptSource::Inline(_)).then(|| path.clone()),
+        temp_files: if matches!(spec.source, ScriptSource::Inline(_)) {
+            vec![path.clone()]
+        } else {
+            Vec::new()
+        },
     };
 
     match kind {
-        // cmd /c call,保留 pause 应答(stdin 喂换行)
+        // Windows 直接交给标准库启动批处理，使用其专用参数转义，避免 CALL 二次展开。
         ScriptKind::Cmd => {
-            cmd.program = "cmd".into();
-            cmd.args = vec![
-                "/c".into(),
-                "call".into(),
-                path.to_string_lossy().into_owned(),
-            ];
+            #[cfg(not(windows))]
+            {
+                cmd.program = "cmd".into();
+                cmd.args = vec![
+                    "/c".into(),
+                    "call".into(),
+                    path.to_string_lossy().into_owned(),
+                ];
+            }
             cmd.feed_newline_stdin = true;
         }
         ScriptKind::PowerShell | ScriptKind::Pwsh => {
@@ -179,12 +210,12 @@ pub(super) fn resolve(spec: &ScriptSpec) -> Result<ResolvedCommand, RunnerError>
             #[cfg(windows)]
             {
                 // Windows 优先探测 Git Bash,其次 WSL
-                if find_in_path("bash") {
-                    cmd.program = "bash".into();
-                    cmd.args = vec![path.to_string_lossy().into_owned()];
+                if let Some(program) = find_shell(shell) {
+                    cmd.program = program.to_string_lossy().into_owned();
+                    cmd.args = vec![path.to_string_lossy().replace('\\', "/")];
                 } else {
-                    cmd.program = "wsl".into();
-                    cmd.args = vec![shell.into(), wsl_path(&path)];
+                    cmd.program = "wsl.exe".into();
+                    cmd.args = vec!["--exec".into(), shell.into(), wsl_path(&path)?];
                 }
             }
             #[cfg(not(windows))]
@@ -197,14 +228,27 @@ pub(super) fn resolve(spec: &ScriptSpec) -> Result<ResolvedCommand, RunnerError>
             let line = command.replace("{script}", &path.to_string_lossy());
             #[cfg(windows)]
             {
-                cmd.program = "cmd".into();
-                cmd.args = vec!["/c".into(), "call".into(), line];
+                // 命令正文保留 shell 语义；参数通过标准库转义后由 %* 原样转交。
+                let wrapper = materialize(&ScriptSpec {
+                    kind: ScriptKind::Cmd,
+                    source: ScriptSource::Inline(format!("@echo off\r\n{line} %*\r\n")),
+                    args: Vec::new(),
+                    working_dir: None,
+                    env: BTreeMap::new(),
+                    env_file: None,
+                })?;
+                cmd.program = wrapper.to_string_lossy().into_owned();
+                cmd.temp_files.push(wrapper);
                 cmd.feed_newline_stdin = true;
             }
             #[cfg(not(windows))]
             {
                 cmd.program = "sh".into();
-                cmd.args = vec!["-c".into(), line];
+                cmd.args = vec![
+                    "-c".into(),
+                    format!("{line} \"$@\""),
+                    "scheduled-task".into(),
+                ];
             }
         }
         // exe / 未知扩展:直接执行
@@ -323,22 +367,71 @@ fn parse_env_file(text: &str) -> Result<BTreeMap<String, String>, RunnerError> {
 }
 
 #[cfg(windows)]
-fn wsl_path(path: &Path) -> String {
+fn wsl_path(path: &Path) -> Result<String, RunnerError> {
     // E:\x\y → /mnt/e/x/y
     let s = path.to_string_lossy().replace('\\', "/");
-    if let Some(rest) = s.strip_prefix('/')
-        && rest.len() >= 2
-        && rest.as_bytes()[1] == b':'
+    let s = s.strip_prefix("//?/").unwrap_or(&s);
+    if s.len() >= 3
+        && s.as_bytes()[0].is_ascii_alphabetic()
+        && s.as_bytes()[1] == b':'
+        && s.as_bytes()[2] == b'/'
     {
-        let drive = rest[..1].to_ascii_lowercase();
-        return format!("/mnt/{drive}{}", &rest[2..]);
+        let drive = s[..1].to_ascii_lowercase();
+        return Ok(format!("/mnt/{drive}{}", &s[2..]));
     }
-    s
+    Err(RunnerError::Resolve(
+        "WSL 脚本需使用默认 /mnt 挂载下的绝对盘符路径；UNC 路径请改用本机 Bash/Sh 或映射盘符"
+            .into(),
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(windows)]
+    fn wsl转换盘符及中文空格路径并明确拒绝网络和相对路径() {
+        for (input, expected) in [
+            (r"E:\脚本目录\备份 空格.sh", "/mnt/e/脚本目录/备份 空格.sh"),
+            ("C:/scripts/test.sh", "/mnt/c/scripts/test.sh"),
+            (r"\\?\D:\文件.sh", "/mnt/d/文件.sh"),
+        ] {
+            assert_eq!(wsl_path(Path::new(input)).unwrap(), expected);
+        }
+        for input in [
+            r"\\server\share\test.sh",
+            "relative.sh",
+            "E:relative.sh",
+            "字:/test.sh",
+            "E字:/test.sh",
+        ] {
+            assert!(wsl_path(Path::new(input)).is_err());
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn 本机解释器按请求类型选择并支持空格和中文目录() {
+        let directory =
+            std::env::temp_dir().join(format!("scheduled-task-shell-{}", std::process::id()));
+        let bash = directory.join("中文 bash");
+        let sh = directory.join("中文 sh");
+        std::fs::create_dir_all(&bash).unwrap();
+        std::fs::create_dir_all(&sh).unwrap();
+        std::fs::write(bash.join("bash.exe"), "").unwrap();
+        std::fs::write(sh.join("sh.exe"), "").unwrap();
+        assert_eq!(
+            find_shell_in_paths("bash", [sh.clone(), bash.clone()].into_iter()),
+            Some(bash.join("bash.exe"))
+        );
+        assert_eq!(
+            find_shell_in_paths("sh", [bash.clone(), sh.clone()].into_iter()),
+            Some(sh.join("sh.exe"))
+        );
+        assert!(find_shell_in_paths("sh", [bash.clone()].into_iter()).is_none());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn concurrent_inline_scripts_keep_distinct_content_and_are_cleaned_up() {
@@ -360,8 +453,8 @@ mod tests {
             env_file: None,
         })
         .unwrap();
-        let first_path = first.temp_file.clone().unwrap();
-        let second_path = second.temp_file.clone().unwrap();
+        let first_path = first.temp_files[0].clone();
+        let second_path = second.temp_files[0].clone();
         assert_ne!(first_path, second_path);
         assert_eq!(std::fs::read_to_string(&first_path).unwrap(), "echo first");
         assert_eq!(
