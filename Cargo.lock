@@ -5654,7 +5654,7 @@ dependencies = [
 
 [[package]]
 name = "scheduled-task"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "async-channel",
  "gpui-kit",
@@ -5670,14 +5670,14 @@ dependencies = [
 
 [[package]]
 name = "scheduled-task-cli"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "scheduled-task-core",
 ]
 
 [[package]]
 name = "scheduled-task-core"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "directories",
  "encoding_rs",
@@ -5694,7 +5694,7 @@ dependencies = [
 
 [[package]]
 name = "scheduled-task-keepalive"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "directories",
  "ron",
