@@ -499,6 +499,49 @@ mod tests {
     }
 
     #[test]
+    fn 任务标识耗尽后拒绝新增且不回绕或修改配置() {
+        let test = TestCore::new();
+        let core = &test.0;
+        let task = core.tasks()[0].clone();
+        core.next_id.store(u64::MAX - 1, Ordering::SeqCst);
+        assert_eq!(core.add(task.clone()).unwrap(), TaskId(u64::MAX - 1));
+        let saved = std::fs::read(core.store.path()).unwrap();
+        let tasks = core.tasks();
+        for _ in 0..2 {
+            assert_eq!(core.add(task.clone()).unwrap_err(), "任务 ID 已耗尽");
+            assert_eq!(core.next_id.load(Ordering::SeqCst), u64::MAX);
+            assert_eq!(core.tasks(), tasks);
+            assert_eq!(core.daemon.tasks_snapshot(), tasks);
+            assert_eq!(std::fs::read(core.store.path()).unwrap(), saved);
+        }
+    }
+
+    #[test]
+    fn 并发新增任务标识唯一且完整持久化() {
+        let test = TestCore::new();
+        let core = &test.0;
+        let template = core.tasks()[0].clone();
+        let mut ids = std::thread::scope(|scope| {
+            (0..8)
+                .map(|index| {
+                    let mut task = template.clone();
+                    task.name = format!("并发新增-{index}");
+                    scope.spawn(move || core.add(task).unwrap().0)
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|thread| thread.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        ids.sort_unstable();
+        assert_eq!(ids, (43..51).collect::<Vec<_>>());
+        let tasks = core.tasks();
+        assert_eq!(tasks.len(), 9);
+        assert_eq!(core.store.load().unwrap().tasks, tasks);
+        assert_eq!(core.daemon.tasks_snapshot(), tasks);
+    }
+
+    #[test]
     fn 所有设置完整落盘后才提交并保留原任务() {
         let test = TestCore::new();
         let core = &test.0;
